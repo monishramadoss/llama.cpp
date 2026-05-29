@@ -3,8 +3,9 @@
 > Status: **experimental / foundational**. This document describes the tiered
 > KV-cache *storage engine* (`src/llama-kv-pager.{h,cpp}`), the numerically
 > stable *streaming attention* primitive (`src/llama-attn-stream.{h,cpp}`) it
-> feeds, and the configuration surface that exposes them. Wiring these into the
-> live ggml attention compute path is intentionally a separate, follow-up step —
+> feeds, the ggml *graph builder* that runs that primitive in the live compute
+> path (`src/llama-attn-stream-graph.{h,cpp}`), and the configuration surface
+> that exposes them. The warm/cold storage *tiers* are still a follow-up step —
 > see [Scope](#scope-and-follow-up-work) below.
 
 ## Motivation
@@ -96,6 +97,39 @@ oracle, invariance to chunk size, numerical stability for very large logits,
 causal and fully-masked rows, the empty stream, instance reuse, and invalid
 configurations.
 
+## Wiring streaming attention into the graph (`llama_attn_stream_build_graph`)
+
+`src/llama-attn-stream-graph.{h,cpp}` lifts the streaming idea into the live ggml
+compute graph. `llama_attn_stream_build_graph()` builds a subgraph that computes
+attention while folding the KV in fixed-size chunks along the token dimension and
+accumulating the partial softmax numerator/denominator across chunks. The
+largest score intermediate it ever materialises is `[chunk, n_query, ...]`
+instead of the full `[n_kv, n_query, ...]` matrix, so the attention working set
+stays bounded regardless of context length. It uses only public ggml ops, so it
+runs on any backend and is unit-tested on the CPU backend
+(`tests/test-attn-stream-graph.cpp`) against a dense reference for several chunk
+sizes, with and without causal masks.
+
+It is hooked into `llm_graph_context::build_attn_mha` as an opt-in fast path. The
+path is enabled by two `llama_cparams` fields, populated from the experimental
+KV-offload config:
+
+| cparams field       | source                | meaning                              |
+|---------------------|-----------------------|--------------------------------------|
+| `attn_streaming`    | `kv_offload_disk`     | use the chunked attention path       |
+| `attn_chunk_tokens` | `kv_page_tokens`      | KV tokens folded per chunk (page)    |
+
+When `attn_streaming` is set and the case is the plain softmax case (no KQ bias,
+sinks, MLA, soft-capping, ALiBi, or Grok logit scaling) the streaming path is
+used **in preference to** flash attention; anything outside that set falls back
+to the existing flash / dense paths, so default behavior is unchanged when the
+feature is off. `llama_context::graph_max_nodes()` is bumped accordingly so the
+extra per-chunk nodes fit in the reserved graph.
+
+`tests/test-attn-stream-e2e.cpp` builds a tiny random LLAMA model and verifies
+that decoding with the streaming path enabled (and a small chunk size) matches
+the dense path to floating-point rounding.
+
 ## Configuration
 
 The following experimental fields were added to `llama_context_params` (and
@@ -126,8 +160,9 @@ configuration surface**. The remaining steps from the design, in order, are:
    cache.
 3. Wire the streaming / chunked online-softmax attention primitive
    (`llama_attn_stream`) into the ggml graph builder so the GPU working set is
-   bounded regardless of context length. ← primitive implemented and unit-tested
-   here; graph integration is the remaining work.
+   bounded regardless of context length. ← **done**: see
+   `llama_attn_stream_build_graph` and its integration into `build_attn_mha`
+   ("Wiring streaming attention into the graph" above).
 4. Disk cold tier in the live path (background I/O thread, prefetch, write-back).
 5. Plumb the parameters through the server and Ollama options. ← config surface
    is ready

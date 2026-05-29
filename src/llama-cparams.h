@@ -43,6 +43,13 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // experimental: streaming / chunked online-softmax attention. When enabled,
+    // the attention is computed by folding the KV in fixed-size chunks so the
+    // score-matrix working set stays bounded regardless of context length.
+    // Off by default; see src/llama-attn-stream-graph.h.
+    bool     attn_streaming;    // enable the chunked online-softmax attention path
+    uint32_t attn_chunk_tokens; // KV tokens folded per chunk (0 => implementation default)
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

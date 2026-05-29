@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-attn-stream-graph.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -2006,7 +2007,48 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // experimental: chunked online-softmax (streaming) attention. Bounds the
+    // score-matrix working set to a single KV chunk regardless of context
+    // length. Restricted to the plain softmax case; anything fancier (KQ bias,
+    // sinks, MLA, soft-capping, ALiBi, Grok) falls back to the paths below.
+    const bool can_stream =
+        cparams.attn_streaming &&
+        kq_b   == nullptr &&
+        sinks  == nullptr &&
+        v_mla  == nullptr &&
+        !hparams.attn_soft_cap &&
+        arch != LLM_ARCH_GROK &&
+        hparams.f_max_alibi_bias == 0.0f;
+
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !can_stream;
+    if (can_stream) {
+        // the helper expects v as [n_kv, d_v, n_head, n_stream]
+        ggml_tensor * v_s = v;
+        if (!v_trans) {
+            v_s = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+            cb(v_s, "v_cont", il);
+        }
+
+        const int64_t chunk = cparams.attn_chunk_tokens > 0 ? (int64_t) cparams.attn_chunk_tokens : 512;
+
+        ggml_tensor * kqv = llama_attn_stream_build_graph(ctx0, q, k, v_s, kq_mask, kq_scale, chunk);
+        cb(kqv, "kqv_stream", il);
+
+        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+
+        // recombine streams
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+        if (!cparams.offload_kqv) {
+            // all nodes between the KV store and the attention output are run on the CPU
+            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        }
+
+        ggml_build_forward_expand(gf, cur);
+
+        return cur;
+    }
+
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 

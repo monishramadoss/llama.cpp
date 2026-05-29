@@ -185,6 +185,13 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // experimental streaming / chunked online-softmax attention. Enabled
+    // alongside the disk-backed tiered KV cache so the GPU attention working set
+    // stays bounded for very long contexts. The chunk size reuses kv_page_tokens
+    // (the page size in tokens) when set, falling back to a default otherwise.
+    cparams.attn_streaming    = params.kv_offload_disk;
+    cparams.attn_chunk_tokens = params.kv_page_tokens != 0 ? params.kv_page_tokens : 512;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -2218,6 +2225,18 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+
+    // the streaming / chunked online-softmax attention path expands each
+    // attention op into O(n_kv / chunk) chunks, each contributing a handful of
+    // nodes. Budget for the worst case so graph reservation does not overflow.
+    if (cparams.attn_streaming) {
+        const uint32_t chunk    = cparams.attn_chunk_tokens > 0 ? cparams.attn_chunk_tokens : 512;
+        const uint32_t n_kv_max = std::max<uint32_t>(n_tokens, cparams.n_ctx_seq);
+        const uint32_t n_chunks = (n_kv_max + chunk - 1) / chunk;
+        // ~16 graph nodes per chunk, per attention layer
+        res += 16u * n_chunks * std::max<uint32_t>(1u, model.hparams.n_layer);
+    }
+
     return res;
 }
 
