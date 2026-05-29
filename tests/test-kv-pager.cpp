@@ -210,6 +210,53 @@ static int test_invalid_config() {
     return 0;
 }
 
+// flush() must write dirty pages back to disk even when they have been evicted
+// to the RAM (warm) tier, and mark_dirty() must reject pages that are not
+// GPU-resident.
+static int test_flush_from_ram_and_mark_dirty_errors() {
+    const size_t   page_bytes = 64;
+    const uint32_t n_pages    = 6;
+
+    llama_kv_pager_params p;
+    p.page_bytes = page_bytes;
+    p.n_pages    = n_pages;
+    p.gpu_pages  = 1; // force the written page to be evicted to RAM
+    p.ram_pages  = 4;
+    p.disk_path  = tmp_path("kv-pager-flush");
+
+    llama_kv_pager pager(p);
+
+    // write page 0, then touch page 1 so page 0 is evicted into the RAM tier
+    void * slot0 = pager.acquire_gpu(0);
+    const auto data0 = make_page(page_bytes, 0);
+    memcpy(slot0, data0.data(), page_bytes);
+    pager.mark_dirty(0);
+
+    pager.acquire_gpu(1);      // evicts dirty page 0 down to RAM
+    CHECK(pager.tier_of(0) == LLAMA_KV_TIER_RAM);
+
+    // mark_dirty on a non-GPU-resident page must throw
+    bool threw = false;
+    try {
+        pager.mark_dirty(0);   // page 0 is in RAM, not GPU
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // flush must write the dirty RAM-resident page 0 back to disk
+    const uint64_t writes_before = pager.stats().disk_writes;
+    pager.flush();
+    CHECK(pager.stats().disk_writes > writes_before);
+
+    // and the data must read back correctly
+    const void * slot = pager.acquire_gpu(0);
+    CHECK(memcmp(slot, data0.data(), page_bytes) == 0);
+
+    remove(p.disk_path.c_str());
+    return 0;
+}
+
 int main() {
     int rc = 0;
     rc |= test_round_trip_with_disk();
@@ -218,6 +265,7 @@ int main() {
     rc |= test_no_disk_fully_resident();
     rc |= test_prefetch();
     rc |= test_invalid_config();
+    rc |= test_flush_from_ram_and_mark_dirty_errors();
 
     if (rc == 0) {
         printf("test-kv-pager: all tests passed\n");

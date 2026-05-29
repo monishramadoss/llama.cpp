@@ -51,7 +51,7 @@ llama_kv_pager::llama_kv_pager(const llama_kv_pager_params & params, llama_kv_pa
         throw std::runtime_error("llama_kv_pager: n_pages must be > 0");
     }
     if (params_.gpu_pages == 0) {
-        throw std::runtime_error("llama_kv_pager: gpu_pages must be >= 1");
+        throw std::runtime_error("llama_kv_pager: gpu_pages must be > 0");
     }
     if (!io_.copy_ram_to_gpu || !io_.copy_gpu_to_ram) {
         throw std::runtime_error("llama_kv_pager: copy hooks must be set");
