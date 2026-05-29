@@ -23,6 +23,16 @@ struct llama_memory_params {
     bool swa_full;
 
     llama_context_type ctx_type;
+
+    // disk-backed tiered KV cache (RAM + disk staging for very long contexts)
+    // see llama-kv-pager.h. When kv_offload_disk is false these are ignored and
+    // the KV cache behaves exactly as before.
+    bool        kv_offload_disk;  // enable the RAM/disk tiered pager
+    const char * kv_disk_path;    // directory/file for the cold (disk) tier
+    uint32_t    kv_page_tokens;   // page size in tokens (0 => implementation default)
+    uint32_t    kv_vram_pages;    // GPU (hot) pool capacity in pages (0 => default)
+    uint32_t    kv_ram_pages;     // host RAM (warm) pool capacity in pages (0 => default)
+    uint32_t    kv_prefetch_depth;// number of pages to prefetch ahead (0 => disabled)
 };
 
 enum llama_memory_status {

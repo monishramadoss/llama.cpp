@@ -300,6 +300,12 @@ llama_context::llama_context(
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
             /*.ctx_type= */ cparams.ctx_type,
+            /*.kv_offload_disk   =*/ params.kv_offload_disk,
+            /*.kv_disk_path      =*/ params.kv_disk_path,
+            /*.kv_page_tokens    =*/ params.kv_page_tokens,
+            /*.kv_vram_pages     =*/ params.kv_vram_pages,
+            /*.kv_ram_pages      =*/ params.kv_ram_pages,
+            /*.kv_prefetch_depth =*/ params.kv_prefetch_depth,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3366,6 +3372,12 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.kv_offload_disk             =*/ false,
+        /*.kv_disk_path                =*/ nullptr,
+        /*.kv_page_tokens              =*/ 0,
+        /*.kv_vram_pages               =*/ 0,
+        /*.kv_ram_pages                =*/ 0,
+        /*.kv_prefetch_depth           =*/ 0,
     };
 
     return result;

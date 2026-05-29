@@ -214,6 +214,10 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+llama_build_and_test(test-kv-pager.cpp)
+target_include_directories(test-kv-pager PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
