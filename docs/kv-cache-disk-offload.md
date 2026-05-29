@@ -1,10 +1,11 @@
 # Disk-Backed (RAM + Disk Tiered) KV Cache
 
 > Status: **experimental / foundational**. This document describes the tiered
-> KV-cache *storage engine* (`src/llama-kv-pager.{h,cpp}`) and the configuration
-> surface that exposes it. Wiring the pager into the live attention compute path
-> (streaming / online-softmax attention) is intentionally a separate, follow-up
-> step — see [Scope](#scope-and-follow-up-work) below.
+> KV-cache *storage engine* (`src/llama-kv-pager.{h,cpp}`), the numerically
+> stable *streaming attention* primitive (`src/llama-attn-stream.{h,cpp}`) it
+> feeds, and the configuration surface that exposes them. Wiring these into the
+> live ggml attention compute path is intentionally a separate, follow-up step —
+> see [Scope](#scope-and-follow-up-work) below.
 
 ## Motivation
 
@@ -59,6 +60,42 @@ Unit tests live in `tests/test-kv-pager.cpp` and cover eviction across all
 tiers, dirty write-back, disk round-trips, page-table consistency, prefetching,
 the all-resident fallback, and invalid configurations.
 
+## Streaming / online-softmax attention (`llama_attn_stream`)
+
+`src/llama-attn-stream.{h,cpp}` implements the compute-side counterpart to the
+pager: numerically stable scaled dot-product attention that consumes the
+keys/values **one chunk (page) at a time** instead of materialising the full
+attention matrix. This is what keeps the GPU working set bounded regardless of
+context length — the pager makes one page of K/V resident, and this primitive
+folds that page into a running softmax before the page can be evicted.
+
+It uses the FlashAttention-style online-softmax recurrence, tracking three
+running quantities per query and rescaling by the change in the running maximum
+for stability:
+
+```
+m   = running max of the scores seen so far   (init -inf)
+l   = running sum of exp(s_j - m)             (init 0)
+acc = running sum of exp(s_j - m) * v_j       (init 0)
+out = acc / l                                 (after all chunks)
+```
+
+The result is identical (up to floating-point rounding) to a one-shot softmax
+but never touches more than one chunk of K/V at once. The API is intentionally
+decoupled from the ggml graph so it can be unit-tested on CPU:
+
+- `begin(q)` binds the query matrix and resets the accumulators.
+- `update(k_chunk, v_chunk, n_keys, mask)` folds one chunk in; an optional
+  additive mask supports causal / sparse attention.
+- `finish(out)` writes the normalised output; rows that saw no unmasked key
+  produce zeros rather than NaNs.
+
+`llama_attn_reference()` is an independent one-shot oracle used by the tests.
+Unit tests live in `tests/test-attn-stream.cpp` and cover parity with the
+oracle, invariance to chunk size, numerical stability for very large logits,
+causal and fully-masked rows, the empty stream, instance reuse, and invalid
+configurations.
+
 ## Configuration
 
 The following experimental fields were added to `llama_context_params` (and
@@ -80,16 +117,17 @@ needs to plumb these as runner options that map onto the parameters above.
 
 ## Scope and follow-up work
 
-This change lands the **storage engine and configuration surface** only. The
-remaining steps from the design, in order, are:
+This change lands the **storage engine, streaming-attention primitive, and
+configuration surface**. The remaining steps from the design, in order, are:
 
 1. Page-based addressing inside the existing KV cache (behavior-identical
    refactor, verify parity). ← partially enabled by this engine
 2. Wire the warm (RAM) tier + pinned staging + async H2D/D2H into the live KV
    cache.
-3. **Streaming / chunked online-softmax attention** in the graph builder so the
-   GPU working set is bounded regardless of context length — this is the key
-   piece that makes dense 1M-token attention feasible on bounded VRAM.
+3. Wire the streaming / chunked online-softmax attention primitive
+   (`llama_attn_stream`) into the ggml graph builder so the GPU working set is
+   bounded regardless of context length. ← primitive implemented and unit-tested
+   here; graph integration is the remaining work.
 4. Disk cold tier in the live path (background I/O thread, prefetch, write-back).
 5. Plumb the parameters through the server and Ollama options. ← config surface
    is ready

@@ -217,6 +217,9 @@ llama_build_and_test(test-regex-partial.cpp)
 llama_build_and_test(test-kv-pager.cpp)
 target_include_directories(test-kv-pager PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-attn-stream.cpp)
+target_include_directories(test-attn-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
