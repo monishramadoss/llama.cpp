@@ -127,6 +127,30 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
+#if !defined(GGML_USE_HIP)
+        // Optionally keep *large* managed allocations resident in host RAM and
+        // let the GPU access them in place (over PCIe) instead of migrating whole
+        // pages into VRAM. This bounds VRAM pressure so a KV cache far larger than
+        // the GPU can be used as a RAM-resident staging tier without OOM, while
+        // smaller allocations (model weight buffers, compute scratch) stay free to
+        // live in VRAM for speed. GGML_CUDA_UM_PREFER_HOST gives the size
+        // threshold in MiB (a bare "1" means 4096 MiB); only allocations >= the
+        // threshold are advised to prefer host. Requires GGML_CUDA_ENABLE_UNIFIED_MEMORY.
+        if (err == cudaSuccess) {
+            const char * th_env = getenv("GGML_CUDA_UM_PREFER_HOST");
+            if (th_env != nullptr) {
+                size_t th_mib = (size_t) atoll(th_env);
+                if (th_mib <= 1) {
+                    th_mib = 4096; // default 4 GiB threshold
+                }
+                if (size >= th_mib * 1024 * 1024) {
+                    (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+                    (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, device);
+                    (void) cudaGetLastError(); // clear any non-fatal advise error
+                }
+            }
+        }
+#endif
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
