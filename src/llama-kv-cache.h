@@ -106,9 +106,11 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                         bool   kv_offload_disk = false,
+              const std::string & kv_disk_path = std::string());
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -252,6 +254,26 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // experimental: back the KV buffers with a memory-mapped file on disk so a
+    // context whose KV cache exceeds RAM can be served (the OS pages the working
+    // set in/out of physical memory). Paired with the streaming attention path,
+    // which scans the KV in chunks for good page-cache locality. See
+    // alloc_disk_buffer().
+    const bool        kv_offload_disk = false;
+    const std::string kv_disk_path;
+
+    // an mmap'd backing file for a KV buffer; munmap'd and removed on destruction
+    struct disk_region {
+        void *      addr = nullptr;
+        size_t      size = 0;
+        int         fd   = -1;
+        std::string path;
+    };
+    std::vector<disk_region> disk_regions;
+
+    // allocate the tensors of ctx into a disk-backed (mmap) buffer on kv_disk_path
+    ggml_backend_buffer_t alloc_disk_buffer(ggml_context * ctx, ggml_backend_buffer_type_t buft, size_t idx);
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

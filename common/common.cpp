@@ -1186,7 +1186,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.fit_params && params.kv_offload_disk) {
+        // the disk-backed KV cache does not reside in host RAM, so the auto-fit
+        // host-memory projection would wrongly try to shrink the context. Skip it.
+        LOG_INF("%s: kv-offload-disk enabled; skipping auto-fit (KV cache is disk-backed)\n", __func__);
+    } else if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
@@ -1587,6 +1591,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+
+    cparams.kv_offload_disk   = params.kv_offload_disk;
+    cparams.kv_disk_path      = params.kv_disk_path.empty() ? nullptr : params.kv_disk_path.c_str();
+    cparams.kv_page_tokens    = (uint32_t) params.kv_page_tokens;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

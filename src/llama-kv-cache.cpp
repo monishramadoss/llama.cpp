@@ -13,6 +13,13 @@
 #include <map>
 #include <stdexcept>
 
+// for the experimental disk-backed (mmap) KV cache
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -90,9 +97,12 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                     bool   kv_offload_disk,
+      const std::string &   kv_disk_path) :
     model(model), hparams(model.hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
+    swa_type(swa_type), kv_offload_disk(kv_offload_disk), kv_disk_path(kv_disk_path) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -253,11 +263,17 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
+        bool disk_backed = false;
         if (model.hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
+        } else if (kv_offload_disk && ggml_backend_buft_is_host(buft)) {
+            // back this (host) KV buffer with a memory-mapped file on disk, so a
+            // context whose KV cache exceeds RAM can be served via OS paging.
+            buf = alloc_disk_buffer(ctx.get(), buft, ctxs_bufs.size());
+            disk_backed = true;
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
@@ -265,9 +281,15 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf),
+                ggml_backend_buffer_get_size(buf)/1024.0/1024.0, disk_backed ? " (disk-backed)" : "");
 
-        ggml_backend_buffer_clear(buf, 0);
+        // a freshly ftruncate'd file already reads as zeros, so clearing a
+        // disk-backed buffer would needlessly fault in (and write back) every
+        // page of a potentially huge file. Skip it in that case.
+        if (!disk_backed) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -327,17 +349,116 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() {
+    // release any disk-backed (mmap) KV buffers and delete their backing files.
+    // ctxs_bufs (CPU buffers wrapping these regions via from_ptr) do not own the
+    // memory, so unmapping here is safe.
+    for (auto & r : disk_regions) {
+        if (r.addr && r.addr != MAP_FAILED) {
+            munmap(r.addr, r.size);
+        }
+        if (r.fd >= 0) {
+            close(r.fd);
+        }
+        if (!r.path.empty()) {
+            unlink(r.path.c_str());
+        }
+    }
+}
+
+ggml_backend_buffer_t llama_kv_cache::alloc_disk_buffer(ggml_context * ctx, ggml_backend_buffer_type_t buft, size_t idx) {
+    const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+    if (size == 0) {
+        // nothing to place here; fall back to the normal (empty) allocation
+        return ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    }
+
+    // resolve the backing file path. kv_disk_path may be a directory (in which
+    // case we create a uniquely named file inside it) or a file-name prefix.
+    std::string path = kv_disk_path.empty() ? std::string("/tmp") : kv_disk_path;
+    {
+        struct stat st = {};
+        const bool is_dir = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        if (is_dir) {
+            if (path.back() == '/') {
+                path.pop_back();
+            }
+            path += "/llama-kv-" + std::to_string((long) getpid()) + "-" + std::to_string(idx) + ".bin";
+        } else {
+            path += "." + std::to_string(idx) + ".bin";
+        }
+    }
+
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        throw std::runtime_error("kv disk offload: failed to open backing file '" + path + "': " + std::strerror(errno));
+    }
+    if (ftruncate(fd, (off_t) size) != 0) {
+        const std::string err = std::strerror(errno);
+        close(fd);
+        throw std::runtime_error("kv disk offload: failed to size '" + path + "' to " + std::to_string(size) + " bytes: " + err);
+    }
+
+    void * addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        const std::string err = std::strerror(errno);
+        close(fd);
+        throw std::runtime_error("kv disk offload: mmap of '" + path + "' (" + std::to_string(size) + " bytes) failed: " + err);
+    }
+
+    // the streaming attention path scans the KV in order, so sequential access
+    // is the dominant pattern; hint the kernel accordingly.
+    madvise(addr, size, MADV_SEQUENTIAL);
+
+    disk_regions.push_back({ addr, size, fd, path });
+
+    LLAMA_LOG_INFO("%s: KV disk offload: mapped %.2f GiB -> %s\n", __func__,
+            size / (1024.0 * 1024.0 * 1024.0), path.c_str());
+
+    // wrap the mapped region as a CPU backend buffer and place the ctx tensors in it
+    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(addr, size);
+    if (!buf) {
+        throw std::runtime_error("kv disk offload: failed to wrap mapped memory in a CPU buffer");
+    }
+
+    // place the ctx tensors into the mapped buffer. Mirror the logic of
+    // ggml_backend_alloc_ctx_tensors_from_buft: real tensors get storage from
+    // the tensor allocator, while views are initialised to alias their source.
+    ggml_tallocr talloc = ggml_tallocr_new(buf);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (t->data == nullptr) {
+            if (t->view_src == nullptr) {
+                status = ggml_tallocr_alloc(&talloc, t);
+            } else {
+                status = ggml_backend_view_init(t);
+            }
+        } else if (t->view_src != nullptr && t->buffer == nullptr) {
+            status = ggml_backend_view_init(t);
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("kv disk offload: failed to place a KV tensor in the disk buffer");
+        }
+    }
+
+    return buf;
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
 
-    if (data) {
+    if (data && !kv_offload_disk) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+    // note: for a disk-backed cache we deliberately do NOT zero the buffers - the
+    // backing file is sparse and already reads as zero, and zeroing would
+    // materialise (and write back) every page of a cache that can be far larger
+    // than RAM. Invalidated cells are masked out by attention, so this is safe.
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

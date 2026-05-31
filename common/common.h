@@ -544,6 +544,11 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    // experimental: disk-backed (RAM + disk) KV cache for contexts larger than RAM
+    bool        kv_offload_disk = false; // enable the disk-backed tiered KV cache
+    std::string kv_disk_path;            // cold-tier path (file or directory) for the KV cache
+    int32_t     kv_page_tokens  = 0;     // KV page / streaming-attention chunk size in tokens (0 => default)
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
