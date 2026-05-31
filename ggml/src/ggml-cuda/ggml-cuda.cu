@@ -3029,6 +3029,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LOG:
             ggml_cuda_op_log(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (ggml_cuda_is_paged_attn(dst)) {
+                ggml_cuda_paged_attn_forward(ctx, dst);
+                break;
+            }
+            return false;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -5340,6 +5346,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_is_paged_attn(op);
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:

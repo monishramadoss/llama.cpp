@@ -31,3 +31,10 @@ extern "C" struct ggml_tensor * ggml_cuda_paged_attn(
     struct ggml_tensor  * mask,
     float                 scale,
     int                   chunk);
+
+// true if op is our paged-attention custom op (so the CUDA backend claims it)
+bool ggml_cuda_is_paged_attn(const struct ggml_tensor * op);
+
+// run the paged-attention op inline on the CUDA backend (q/mask/out on device,
+// K/V streamed from host into a bounded device scratch on ctx's stream)
+void ggml_cuda_paged_attn_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
