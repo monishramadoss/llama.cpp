@@ -2039,7 +2039,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
-        if (!cparams.offload_kqv) {
+        // Run the chunked attention on the CPU when the KV cache is disk-backed.
+        // The KV tensors live in host (mmap'd) memory, so attention reads them
+        // directly from the OS page cache; letting the scheduler place the
+        // chunked path on the GPU instead makes it size a worst-case compute
+        // buffer for the full context (tens to hundreds of GiB) and OOM. The
+        // model weights and all other layers still run on the GPU.
+        if (!cparams.offload_kqv || cparams.attn_streaming) {
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }

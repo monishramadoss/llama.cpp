@@ -200,7 +200,11 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        // when the KV cache is disk-backed it must live in host memory (an mmap'd
+        // file) regardless of compute offload, so it can be far larger than VRAM.
+        // The model weights and attention compute still run on the GPU; KV chunks
+        // are staged host->device on demand by the scheduler.
+        if (offload && !kv_offload_disk) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
