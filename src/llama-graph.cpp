@@ -2031,7 +2031,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         const int64_t chunk = cparams.attn_chunk_tokens > 0 ? (int64_t) cparams.attn_chunk_tokens : 512;
 
-        ggml_tensor * kqv = llama_attn_stream_build_graph(ctx0, q, k, v_s, kq_mask, kq_scale, chunk);
+        // GPU paged attention: when the model is offloaded and a CUDA backend
+        // exposes the paged-attention op, compute attention on the GPU while the
+        // (host/disk-resident) KV is streamed chunk-by-chunk into a bounded VRAM
+        // scratch. Falls back to the CPU chunked path otherwise.
+        typedef ggml_tensor * (*paged_attn_fn)(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, int);
+        static paged_attn_fn paged = []() -> paged_attn_fn {
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                void * p = ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_cuda_paged_attn");
+                if (p) return (paged_attn_fn) p;
+            }
+            return nullptr;
+        }();
+
+        bool gpu_paged = false;
+        ggml_tensor * kqv = nullptr;
+        if (paged && cparams.offload_kqv) {
+            kqv = paged(ctx0, q, k, v_s, kq_mask, kq_scale, (int) chunk);
+            gpu_paged = true;
+        } else {
+            kqv = llama_attn_stream_build_graph(ctx0, q, k, v_s, kq_mask, kq_scale, chunk);
+        }
         cb(kqv, "kqv_stream", il);
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
@@ -2039,14 +2059,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
-        // Run the chunked attention on the CPU when the KV cache is disk-backed.
-        // The KV tensors live in host (mmap'd) memory, so attention reads them
-        // directly from the OS page cache; letting the scheduler place the
-        // chunked path on the GPU instead makes it size a worst-case compute
-        // buffer for the full context (tens to hundreds of GiB) and OOM. The
-        // model weights and all other layers still run on the GPU.
-        if (!cparams.offload_kqv || cparams.attn_streaming) {
-            // all nodes between the KV store and the attention output are run on the CPU
+        // When NOT using the GPU paged op, run the chunked attention on the CPU
+        // (the KV is host/mmap'd; letting the scheduler place the in-graph chunked
+        // path on the GPU sizes a worst-case full-context buffer and OOMs). The
+        // GPU paged op manages its own bounded VRAM scratch, so leave it be.
+        if (!gpu_paged && (!cparams.offload_kqv || cparams.attn_streaming)) {
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
 

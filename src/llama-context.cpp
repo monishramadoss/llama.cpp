@@ -2226,17 +2226,32 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += lora->get_n_nodes();
     }
 
-    // the streaming / chunked online-softmax attention path expands each
-    // attention op into O(n_kv / chunk) chunks, each contributing a handful of
-    // nodes. Budget for the worst case so graph reservation does not overflow.
     if (cparams.attn_streaming) {
-        const uint32_t chunk    = cparams.attn_chunk_tokens > 0 ? cparams.attn_chunk_tokens : 512;
-        const uint32_t n_kv_max = std::max<uint32_t>(n_tokens, cparams.n_ctx_seq);
-        const uint32_t n_chunks = (n_kv_max + chunk - 1) / chunk;
-        // the stable online-softmax recurrence emits ~27 nodes per chunk per
-        // attention layer (slice/cont, scores, row-max pooling, the running-max
-        // rescale, and the numerator/denominator updates). Budget 48 for margin.
-        res += 48u * n_chunks * std::max<uint32_t>(1u, model.hparams.n_layer);
+        const uint32_t n_layer = std::max<uint32_t>(1u, model.hparams.n_layer);
+
+        // Is the GPU paged-attention op available? If so (and we are offloading),
+        // attention is a single custom op per layer rather than the in-graph
+        // chunked path, so the node budget is tiny and independent of context.
+        static const bool have_paged = []() {
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                if (ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_cuda_paged_attn")) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+
+        if (cparams.offload_kqv && have_paged) {
+            // ggml_cont + ggml_scale + custom op + permute + cont_2d ~= a handful
+            res += 8u * n_layer;
+        } else {
+            // CPU in-graph chunked path expands each attention op into
+            // O(n_kv / chunk) chunks, ~27 nodes each; budget 48 for margin.
+            const uint32_t chunk    = cparams.attn_chunk_tokens > 0 ? cparams.attn_chunk_tokens : 512;
+            const uint32_t n_kv_max = std::max<uint32_t>(n_tokens, cparams.n_ctx_seq);
+            const uint32_t n_chunks = (n_kv_max + chunk - 1) / chunk;
+            res += 48u * n_chunks * n_layer;
+        }
     }
 
     return res;
