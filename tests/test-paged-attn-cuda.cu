@@ -92,45 +92,69 @@ void paged_attn_cuda(
     const int ldn = chunk;
     const size_t es = kv_f16 ? 2 : 4; // KV element size
 
-    char *d_Kc=0,*d_Vc=0; float *d_q=0,*d_maskc=0,*d_scores=0,*d_m=0,*d_l=0,*d_acc=0,*d_out=0;
+    // Persistent, reused-across-calls scratch + streams/events (paged attention is
+    // invoked once per attention layer per token, so per-call cudaMalloc/Free and
+    // cudaDeviceSynchronize would dominate). Double-buffered K/V/mask so the H2D
+    // copy of chunk i+1 overlaps the (serial) online-softmax compute of chunk i.
+    struct ctx_t {
+        cudaStream_t copyS=0, compS=0;
+        cudaEvent_t evcopy[2]={0,0}, evcomp[2]={0,0};
+        char *Kc[2]={0,0}, *Vc[2]={0,0}; float *maskc[2]={0,0};
+        float *q=0,*scores=0,*m=0,*l=0,*acc=0,*out=0;
+        size_t capKc=0,capVc=0,capMsk=0,capQ=0,capScr=0,capM=0,capL=0,capAcc=0,capOut=0; bool init=false;
+    };
+    static ctx_t c;
+    auto ensure=[&](void** p,size_t* cap,size_t need){ if(*cap<need){ cudaFree(*p); cudaMalloc(p,need); *cap=need; } };
+    auto ensure2=[&](char** p0,char** p1,size_t* cap,size_t need){ if(*cap<need){ cudaFree(*p0);cudaFree(*p1); cudaMalloc((void**)p0,need);cudaMalloc((void**)p1,need); *cap=need; } };
+    if (!c.init){ cudaStreamCreate(&c.copyS); cudaStreamCreate(&c.compS);
+        for(int s=0;s<2;++s){cudaEventCreateWithFlags(&c.evcopy[s],cudaEventDisableTiming); cudaEventCreateWithFlags(&c.evcomp[s],cudaEventDisableTiming);} c.init=true; }
+
     size_t sz_q=(size_t)d_k*n_q*n_head*4, sz_Kc=(size_t)d_k*ldn*n_head_kv*es, sz_Vc=(size_t)ldn*d_v*n_head_kv*es;
     size_t sz_msk=mask?(size_t)ldn*n_q*4:0, sz_scr=(size_t)ldn*n_q*n_head*4, sz_ml=(size_t)n_q*n_head*4, sz_acc=(size_t)d_v*n_q*n_head*4;
-    g_paged_attn_peak_scratch = sz_q+sz_Kc+sz_Vc+sz_msk+sz_scr+2*sz_ml+2*sz_acc;
-    CUDA_OK(cudaMalloc(&d_q,sz_q)); CUDA_OK(cudaMalloc(&d_Kc,sz_Kc)); CUDA_OK(cudaMalloc(&d_Vc,sz_Vc));
-    if(mask) CUDA_OK(cudaMalloc(&d_maskc,sz_msk));
-    CUDA_OK(cudaMalloc(&d_scores,sz_scr)); CUDA_OK(cudaMalloc(&d_m,sz_ml)); CUDA_OK(cudaMalloc(&d_l,sz_ml));
-    CUDA_OK(cudaMalloc(&d_acc,sz_acc)); CUDA_OK(cudaMalloc(&d_out,sz_acc));
-    CUDA_OK(cudaMemcpy(d_q,q,sz_q,cudaMemcpyHostToDevice));
-    { size_t mn=(size_t)n_q*n_head; float* hm=(float*)malloc(mn*4); for(size_t i=0;i<mn;++i) hm[i]=-INFINITY;
-      CUDA_OK(cudaMemcpy(d_m,hm,sz_ml,cudaMemcpyHostToDevice)); free(hm);
-      CUDA_OK(cudaMemset(d_l,0,sz_ml)); CUDA_OK(cudaMemset(d_acc,0,sz_acc)); }
-    for (int off=0; off<n_kv; off+=chunk) {
-        int n = (off+chunk<=n_kv)?chunk:(n_kv-off);
-        for (int hk=0; hk<n_head_kv; ++hk) // K: gather n keys (each d_k contiguous) at byte stride k_nb1
-            CUDA_OK(cudaMemcpy2D(d_Kc+(size_t)hk*d_k*ldn*es, (size_t)d_k*es,
-                                 (const char*)k+hk*k_nb2+(size_t)off*k_nb1, k_nb1,
-                                 (size_t)d_k*es, (size_t)n, cudaMemcpyHostToDevice));
-        for (int hk=0; hk<n_head_kv; ++hk) // V: n keys contiguous, d_v cols at byte stride v_nb1
-            CUDA_OK(cudaMemcpy2D(d_Vc+(size_t)hk*ldn*d_v*es, (size_t)ldn*es,
-                                 (const char*)v+hk*v_nb2+(size_t)off*es, v_nb1,
-                                 (size_t)n*es, (size_t)d_v, cudaMemcpyHostToDevice));
-        if (mask)
-            CUDA_OK(cudaMemcpy2D(d_maskc,(size_t)ldn*4, (const char*)mask+(size_t)off*4, mask_nb1,
-                                 (size_t)n*4,(size_t)n_q,cudaMemcpyHostToDevice));
+    g_paged_attn_peak_scratch = sz_q+2*sz_Kc+2*sz_Vc+2*sz_msk+sz_scr+2*sz_ml+sz_acc;
+    ensure2(&c.Kc[0],&c.Kc[1],&c.capKc,sz_Kc); ensure2(&c.Vc[0],&c.Vc[1],&c.capVc,sz_Vc);
+    if(mask) ensure2((char**)&c.maskc[0],(char**)&c.maskc[1],&c.capMsk,sz_msk);
+    ensure((void**)&c.q,&c.capQ,sz_q); ensure((void**)&c.scores,&c.capScr,sz_scr);
+    ensure((void**)&c.m,&c.capM,sz_ml); ensure((void**)&c.l,&c.capL,sz_ml); ensure((void**)&c.acc,&c.capAcc,sz_acc); ensure((void**)&c.out,&c.capOut,sz_acc);
+
+    // q copy + state init on compute stream (orders before the first compute)
+    CUDA_OK(cudaMemcpyAsync(c.q,q,sz_q,cudaMemcpyHostToDevice,c.compS));
+    { std::vector<float> hm((size_t)n_q*n_head,-INFINITY);
+      CUDA_OK(cudaMemcpyAsync(c.m,hm.data(),sz_ml,cudaMemcpyHostToDevice,c.compS));
+      CUDA_OK(cudaMemsetAsync(c.l,0,sz_ml,c.compS)); CUDA_OK(cudaMemsetAsync(c.acc,0,sz_acc,c.compS)); }
+
+    auto stage=[&](int off,int slot){
+        int n=(off+chunk<=n_kv)?chunk:(n_kv-off);
+        for(int hk=0;hk<n_head_kv;++hk)
+            cudaMemcpy2DAsync(c.Kc[slot]+(size_t)hk*d_k*ldn*es,(size_t)d_k*es,
+                              (const char*)k+hk*k_nb2+(size_t)off*k_nb1,k_nb1,(size_t)d_k*es,(size_t)n,cudaMemcpyHostToDevice,c.copyS);
+        for(int hk=0;hk<n_head_kv;++hk)
+            cudaMemcpy2DAsync(c.Vc[slot]+(size_t)hk*ldn*d_v*es,(size_t)ldn*es,
+                              (const char*)v+hk*v_nb2+(size_t)off*es,v_nb1,(size_t)n*es,(size_t)d_v,cudaMemcpyHostToDevice,c.copyS);
+        if(mask)
+            cudaMemcpy2DAsync(c.maskc[slot],(size_t)ldn*4,(const char*)mask+(size_t)off*4,mask_nb1,(size_t)n*4,(size_t)n_q,cudaMemcpyHostToDevice,c.copyS);
+    };
+
+    const int N = (n_kv+chunk-1)/chunk;
+    stage(0,0); cudaEventRecord(c.evcopy[0],c.copyS);
+    for (int i=0;i<N;++i){
+        int s=i&1, ns=(i+1)&1, off=i*chunk, n=(off+chunk<=n_kv)?chunk:(n_kv-off);
+        if (i+1<N){ cudaStreamWaitEvent(c.copyS,c.evcomp[ns],0); stage((i+1)*chunk,ns); cudaEventRecord(c.evcopy[ns],c.copyS); }
+        cudaStreamWaitEvent(c.compS,c.evcopy[s],0);
         dim3 gs((n+63)/64,n_q,n_head), gm((n_q+63)/64,n_head,1), b(64,1,1);
-        if (kv_f16) {
-            k_scores<<<gs,b>>>((const __half*)d_Kc,d_q,mask?d_maskc:0,d_scores,d_k,n,ldn,n_q,n_head,g,scale);
-            k_merge<<<gm,b>>>(d_scores,(const __half*)d_Vc,d_m,d_l,d_acc,n,ldn,d_v,n_q,n_head,g);
+        if (kv_f16){
+            k_scores<<<gs,b,0,c.compS>>>((const __half*)c.Kc[s],c.q,mask?c.maskc[s]:0,c.scores,d_k,n,ldn,n_q,n_head,g,scale);
+            k_merge<<<gm,b,0,c.compS>>>(c.scores,(const __half*)c.Vc[s],c.m,c.l,c.acc,n,ldn,d_v,n_q,n_head,g);
         } else {
-            k_scores<<<gs,b>>>((const float*)d_Kc,d_q,mask?d_maskc:0,d_scores,d_k,n,ldn,n_q,n_head,g,scale);
-            k_merge<<<gm,b>>>(d_scores,(const float*)d_Vc,d_m,d_l,d_acc,n,ldn,d_v,n_q,n_head,g);
+            k_scores<<<gs,b,0,c.compS>>>((const float*)c.Kc[s],c.q,mask?c.maskc[s]:0,c.scores,d_k,n,ldn,n_q,n_head,g,scale);
+            k_merge<<<gm,b,0,c.compS>>>(c.scores,(const float*)c.Vc[s],c.m,c.l,c.acc,n,ldn,d_v,n_q,n_head,g);
         }
-        CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+        cudaEventRecord(c.evcomp[s],c.compS);
     }
-    k_finalize<<<dim3((d_v+63)/64,n_q,n_head),dim3(64,1,1)>>>(d_acc,d_l,d_out,d_v,n_q,n_head);
-    CUDA_OK(cudaGetLastError()); CUDA_OK(cudaMemcpy(out,d_out,sz_acc,cudaMemcpyDeviceToHost));
-    cudaFree(d_q);cudaFree(d_Kc);cudaFree(d_Vc);if(d_maskc)cudaFree(d_maskc);
-    cudaFree(d_scores);cudaFree(d_m);cudaFree(d_l);cudaFree(d_acc);cudaFree(d_out);
+    k_finalize<<<dim3((d_v+63)/64,n_q,n_head),dim3(64,1,1),0,c.compS>>>(c.acc,c.l,c.out,d_v,n_q,n_head);
+    CUDA_OK(cudaMemcpyAsync(out,c.out,sz_acc,cudaMemcpyDeviceToHost,c.compS));
+    CUDA_OK(cudaStreamSynchronize(c.compS));
+    CUDA_OK(cudaGetLastError());
 }
 
 // ---------------- test ----------------
