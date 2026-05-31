@@ -2233,8 +2233,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         const uint32_t chunk    = cparams.attn_chunk_tokens > 0 ? cparams.attn_chunk_tokens : 512;
         const uint32_t n_kv_max = std::max<uint32_t>(n_tokens, cparams.n_ctx_seq);
         const uint32_t n_chunks = (n_kv_max + chunk - 1) / chunk;
-        // ~16 graph nodes per chunk, per attention layer
-        res += 16u * n_chunks * std::max<uint32_t>(1u, model.hparams.n_layer);
+        // the stable online-softmax recurrence emits ~27 nodes per chunk per
+        // attention layer (slice/cont, scores, row-max pooling, the running-max
+        // rescale, and the numerator/denominator updates). Budget 48 for margin.
+        res += 48u * n_chunks * std::max<uint32_t>(1u, model.hparams.n_layer);
     }
 
     return res;
