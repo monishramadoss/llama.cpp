@@ -174,9 +174,10 @@ New cases, alongside the existing single-file coverage (which must keep passing)
    as fresh — pages read back as zero, no stale bytes from the prior run.
 5. **Mode selection.** `disk_shards == 0` still selects `DISK_FILE`; all existing
    single-file tests unchanged.
-6. **Invalid configs.** `disk_shards >= 1` with empty `disk_path`; `disk_path`
-   exists but is a regular file; `n_shards > n_pages` (clamp or error — pick one
-   and assert it).
+6. **Invalid / edge configs.** `disk_shards >= 1` with empty `disk_path` (error);
+   `disk_path` exists but is a regular file (error); `n_shards > n_pages` →
+   **clamped** to `n_pages` at construction (so empty shards are never created);
+   assert the clamp.
 
 ## 6. User-implemented unit: `manifest_compatible(...)`
 
