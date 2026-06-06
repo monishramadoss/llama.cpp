@@ -99,10 +99,12 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
                      bool   kv_offload_disk,
-      const std::string &   kv_disk_path) :
+      const std::string &   kv_disk_path,
+                 uint32_t   kv_disk_shards) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
-    swa_type(swa_type), kv_offload_disk(kv_offload_disk), kv_disk_path(kv_disk_path) {
+    swa_type(swa_type), kv_offload_disk(kv_offload_disk), kv_disk_path(kv_disk_path),
+    kv_disk_shards(kv_disk_shards) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 

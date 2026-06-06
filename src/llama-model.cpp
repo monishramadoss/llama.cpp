@@ -2096,7 +2096,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 params.kv_offload_disk,
-                                params.kv_disk_path ? params.kv_disk_path : "");
+                                params.kv_disk_path ? params.kv_disk_path : "",
+                                params.kv_disk_shards);
                     }
                 }
             }

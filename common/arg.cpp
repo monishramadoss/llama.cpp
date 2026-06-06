@@ -2039,6 +2039,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_DISK_PATH"));
     add_opt(common_arg(
+        {"--kv-disk-shards"}, "N",
+        "number of shard files for a folder-based disk-backed KV cold tier; implies a directory --kv-disk-path (default: 8 when a folder is given)",
+        [](common_params & params, int value) {
+            params.kv_disk_shards = value;
+            params.kv_offload_disk = true;
+        }
+    ).set_env("LLAMA_ARG_KV_DISK_SHARDS"));
+    add_opt(common_arg(
         {"--kv-page-tokens"}, "N",
         "KV page / streaming-attention chunk size in tokens for disk-backed KV (0 = default)",
         [](common_params & params, int value) {

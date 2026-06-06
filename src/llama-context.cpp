@@ -313,6 +313,7 @@ llama_context::llama_context(
             /*.kv_vram_pages     =*/ params.kv_vram_pages,
             /*.kv_ram_pages      =*/ params.kv_ram_pages,
             /*.kv_prefetch_depth =*/ params.kv_prefetch_depth,
+            /*.kv_disk_shards    =*/ params.kv_disk_shards,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3414,6 +3415,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_vram_pages               =*/ 0,
         /*.kv_ram_pages                =*/ 0,
         /*.kv_prefetch_depth           =*/ 0,
+        /*.kv_disk_shards              =*/ 0,
     };
 
     return result;

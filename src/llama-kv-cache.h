@@ -108,7 +108,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
                          bool   kv_offload_disk = false,
-              const std::string & kv_disk_path = std::string());
+              const std::string & kv_disk_path = std::string(),
+                         uint32_t kv_disk_shards = 0);
 
     ~llama_kv_cache();
 
@@ -262,6 +263,7 @@ private:
     // alloc_disk_buffer().
     const bool        kv_offload_disk = false;
     const std::string kv_disk_path;
+    const uint32_t    kv_disk_shards = 0; // folder cold-tier shard count (config-ready; not yet live)
 
     // an mmap'd backing file for a KV buffer; munmap'd and removed on destruction
     struct disk_region {

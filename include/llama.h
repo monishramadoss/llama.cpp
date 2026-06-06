@@ -398,6 +398,7 @@ extern "C" {
         uint32_t     kv_vram_pages;     // GPU (hot) pool capacity in pages (0 => default)
         uint32_t     kv_ram_pages;      // host RAM (warm) pool capacity in pages (0 => default)
         uint32_t     kv_prefetch_depth; // pages to prefetch ahead (0 => disabled)
+        uint32_t     kv_disk_shards;    // shard files for a folder cold tier (0 => single file; folder path => default 8)
     };
 
     struct llama_model_tensor_override {

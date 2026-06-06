@@ -548,6 +548,7 @@ struct common_params {
     bool        kv_offload_disk = false; // enable the disk-backed tiered KV cache
     std::string kv_disk_path;            // cold-tier path (file or directory) for the KV cache
     int32_t     kv_page_tokens  = 0;     // KV page / streaming-attention chunk size in tokens (0 => default)
+    int32_t     kv_disk_shards  = 0;     // folder cold-tier shard count (0 => single file; folder path => default 8)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
