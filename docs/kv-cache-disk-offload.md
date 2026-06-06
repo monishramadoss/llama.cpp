@@ -145,6 +145,21 @@ before:
 | `kv_vram_pages`     | GPU (hot) pool capacity in pages (0 ⇒ default)      |
 | `kv_ram_pages`      | host RAM (warm) pool capacity in pages (0 ⇒ default)|
 | `kv_prefetch_depth` | pages to prefetch ahead (0 ⇒ disabled)              |
+| `kv_disk_shards`    | shard files for a folder cold tier (0 ⇒ single file; folder path ⇒ default 8) |
+
+### Folder (sharded) cold tier
+
+When `kv_disk_path` names a directory and `kv_disk_shards >= 1`, the pager's cold
+tier stripes pages across `kv_disk_shards` shard files inside that folder
+(`shard = page % n_shards`, `offset = (page / n_shards) * page_bytes`) instead of
+using a single pre-sized file. The shards are created sparse (no startup
+pre-zeroing). A `kv-cache.manifest` in the folder records the geometry, a
+caller-supplied fingerprint, and a per-page valid bitmap, so a folder can be
+**resumed** across runs: on a matching fingerprint + geometry the written pages
+are restored to the disk tier; on any mismatch the folder is treated as fresh.
+This is implemented in the pager engine (`src/llama-kv-pager.{h,cpp}`) and is
+exercised by `tests/test-kv-pager.cpp`; like the rest of the cold tier it is not
+yet wired into the live decode path.
 
 For Ollama (which wraps llama.cpp), no algorithmic change is required: it only
 needs to plumb these as runner options that map onto the parameters above.
