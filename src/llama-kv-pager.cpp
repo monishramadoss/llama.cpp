@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
+#include <algorithm>
 
 // portable 64-bit file seek (large page-backing files can exceed 2 GiB)
 #if defined(_WIN32)
@@ -13,6 +15,26 @@
 #else
 #   define llama_kv_pager_fseek(stream, offset, whence) std::fseek(stream, (long) (offset), whence)
 #endif
+
+#if defined(_WIN32)
+#  include <direct.h>
+#  include <io.h>
+#  include <sys/stat.h>
+static int  kv_mkdir(const char * p)                 { return _mkdir(p); }
+static int  kv_ftruncate(std::FILE * f, long long n) { return _chsize_s(_fileno(f), n); }
+static bool kv_isdir(const char * p)  { struct _stat st; return _stat(p, &st) == 0 && (st.st_mode & _S_IFDIR); }
+static bool kv_exists(const char * p) { struct _stat st; return _stat(p, &st) == 0; }
+#else
+#  include <sys/stat.h>
+#  include <unistd.h>
+static int  kv_mkdir(const char * p)                 { return mkdir(p, 0700); }
+static int  kv_ftruncate(std::FILE * f, long long n) { return ftruncate(fileno(f), (off_t) n); }
+static bool kv_isdir(const char * p)  { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+static bool kv_exists(const char * p) { struct stat st; return stat(p, &st) == 0; }
+#endif
+
+static const char     KV_MANIFEST_MAGIC[8] = {'K','V','P','G','R','M','F','1'};
+static const uint32_t KV_MANIFEST_VERSION  = 1;
 
 llama_kv_pager_io llama_kv_pager_io::make_default() {
     llama_kv_pager_io io;
@@ -62,7 +84,18 @@ llama_kv_pager::llama_kv_pager(const llama_kv_pager_params & params, llama_kv_pa
 
     pages_.assign(params_.n_pages, page_meta{});
 
-    if (!params_.disk_path.empty()) {
+    if (params_.disk_path.empty()) {
+        disk_mode_ = DISK_NONE;
+        // without a disk tier every page must fit in the resident tiers
+        if (params_.ram_pages + params_.gpu_pages < params_.n_pages) {
+            throw std::runtime_error(
+                "llama_kv_pager: no disk tier and resident pools too small to hold all pages");
+        }
+    } else if (params_.disk_shards >= 1) {
+        disk_mode_ = DISK_FOLDER;
+        open_or_create_folder();
+    } else {
+        disk_mode_ = DISK_FILE;
         // open the backing file for read+write and pre-size it so page offsets
         // are valid up front (avoids fragmentation and out-of-range seeks).
         // NOTE: "w+b" truncates any existing file, which is the desired
@@ -79,12 +112,6 @@ llama_kv_pager::llama_kv_pager(const llama_kv_pager_params & params, llama_kv_pa
             }
         }
         std::fflush(file_.get());
-    } else {
-        // without a disk tier every page must fit in the resident tiers
-        if (params_.ram_pages + params_.gpu_pages < params_.n_pages) {
-            throw std::runtime_error(
-                "llama_kv_pager: no disk tier and resident pools too small to hold all pages");
-        }
     }
 
     if (params_.verbose) {
@@ -92,6 +119,174 @@ llama_kv_pager::llama_kv_pager(const llama_kv_pager_params & params, llama_kv_pa
             "%s: page_bytes=%zu n_pages=%u gpu_pages=%u ram_pages=%u disk=%s prefetch=%u\n",
             __func__, params_.page_bytes, params_.n_pages, params_.gpu_pages, params_.ram_pages,
             params_.disk_path.empty() ? "(none)" : params_.disk_path.c_str(), params_.prefetch_depth);
+    }
+}
+
+std::string llama_kv_pager::shard_path(uint32_t shard) const {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "/shard-%03u.bin", shard);
+    return folder_path_ + buf;
+}
+
+bool llama_kv_pager::page_is_valid(uint32_t page) const {
+    return (page_valid_[page >> 3] >> (page & 7)) & 1u;
+}
+
+void llama_kv_pager::set_page_valid(uint32_t page) {
+    page_valid_[page >> 3] |= (uint8_t) (1u << (page & 7));
+}
+
+// Decide whether an existing on-disk manifest may be reused for the current run.
+// Returns true only if reusing the folder's shards is safe; false forces a fresh
+// (scratch) folder. Geometry mismatches (page_bytes / n_pages / n_shards) are
+// fatal-to-reuse; a supplied fingerprint must match; an empty current fingerprint
+// means resume was not requested.
+//
+// NOTE: this is the learning-mode handoff point from the plan (Task 4). The body
+// below is the reference predicate; swap in your own policy if you want different
+// resume semantics (e.g. tolerate a version bump, or ignore the fingerprint).
+bool llama_kv_pager::manifest_compatible(const kv_manifest & on_disk,
+                                         const llama_kv_pager_params & want,
+                                         uint32_t want_shards) {
+    if (want.disk_fingerprint.empty())                   return false; // resume not requested
+    if (on_disk.version     != KV_MANIFEST_VERSION)      return false;
+    if (on_disk.page_bytes  != want.page_bytes)          return false;
+    if (on_disk.n_pages     != want.n_pages)             return false;
+    if (on_disk.n_shards    != want_shards)              return false;
+    if (on_disk.fingerprint != want.disk_fingerprint)    return false;
+    return true;
+}
+
+bool llama_kv_pager::read_manifest(kv_manifest & out) const {
+    const std::string mpath = folder_path_ + "/kv-cache.manifest";
+    std::FILE * f = std::fopen(mpath.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    std::unique_ptr<std::FILE, file_deleter> guard(f);
+
+    char magic[8];
+    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, KV_MANIFEST_MAGIC, 8) != 0) {
+        return false;
+    }
+    uint32_t fp_len = 0;
+    if (std::fread(&out.version,    sizeof out.version,    1, f) != 1) return false;
+    if (std::fread(&out.page_bytes, sizeof out.page_bytes, 1, f) != 1) return false;
+    if (std::fread(&out.n_pages,    sizeof out.n_pages,    1, f) != 1) return false;
+    if (std::fread(&out.n_shards,   sizeof out.n_shards,   1, f) != 1) return false;
+    if (std::fread(&fp_len,         sizeof fp_len,         1, f) != 1) return false;
+
+    out.fingerprint.resize(fp_len);
+    if (fp_len && std::fread(&out.fingerprint[0], 1, fp_len, f) != fp_len) {
+        return false;
+    }
+    const size_t bitmap_bytes = (out.n_pages + 7) / 8;
+    out.valid_bitmap.resize(bitmap_bytes);
+    if (bitmap_bytes && std::fread(out.valid_bitmap.data(), 1, bitmap_bytes, f) != bitmap_bytes) {
+        return false;
+    }
+    return true;
+}
+
+void llama_kv_pager::write_manifest() {
+    const std::string mpath = folder_path_ + "/kv-cache.manifest";
+    std::FILE * f = std::fopen(mpath.c_str(), "wb");
+    if (!f) {
+        throw std::runtime_error("llama_kv_pager: failed to open manifest for write: " + mpath);
+    }
+    std::unique_ptr<std::FILE, file_deleter> guard(f);
+
+    const uint32_t version = KV_MANIFEST_VERSION;
+    const uint64_t pb      = params_.page_bytes;
+    const uint32_t fp_len  = (uint32_t) params_.disk_fingerprint.size();
+
+    bool ok = true;
+    ok = ok && std::fwrite(KV_MANIFEST_MAGIC, 1, 8, f) == 8;
+    ok = ok && std::fwrite(&version,         sizeof version,         1, f) == 1;
+    ok = ok && std::fwrite(&pb,              sizeof pb,              1, f) == 1;
+    ok = ok && std::fwrite(&params_.n_pages, sizeof params_.n_pages, 1, f) == 1;
+    ok = ok && std::fwrite(&n_shards_,       sizeof n_shards_,       1, f) == 1;
+    ok = ok && std::fwrite(&fp_len,          sizeof fp_len,          1, f) == 1;
+    if (fp_len) {
+        ok = ok && std::fwrite(params_.disk_fingerprint.data(), 1, fp_len, f) == fp_len;
+    }
+    if (!page_valid_.empty()) {
+        ok = ok && std::fwrite(page_valid_.data(), 1, page_valid_.size(), f) == page_valid_.size();
+    }
+    std::fflush(f);
+    if (!ok) {
+        throw std::runtime_error("llama_kv_pager: failed to write manifest body: " + mpath);
+    }
+}
+
+void llama_kv_pager::open_or_create_folder() {
+    if (params_.disk_path.empty()) {
+        throw std::runtime_error("llama_kv_pager: disk_shards >= 1 requires a directory disk_path");
+    }
+
+    folder_path_ = params_.disk_path;
+    while (!folder_path_.empty() && folder_path_.back() == '/') {
+        folder_path_.pop_back();
+    }
+
+    if (kv_exists(folder_path_.c_str())) {
+        if (!kv_isdir(folder_path_.c_str())) {
+            throw std::runtime_error("llama_kv_pager: disk_path exists and is not a directory: " + folder_path_);
+        }
+    } else if (kv_mkdir(folder_path_.c_str()) != 0) {
+        throw std::runtime_error("llama_kv_pager: failed to create folder: " + folder_path_);
+    }
+
+    // clamp shard count so empty shards are never created
+    n_shards_ = params_.disk_shards;
+    if (n_shards_ > params_.n_pages) {
+        n_shards_ = params_.n_pages;
+    }
+
+    const size_t bitmap_bytes = (params_.n_pages + 7) / 8;
+    page_valid_.assign(bitmap_bytes, 0);
+
+    const uint32_t  pages_per_shard = (params_.n_pages + n_shards_ - 1) / n_shards_;
+    const long long shard_bytes     = (long long) ((size_t) pages_per_shard * params_.page_bytes);
+
+    // decide whether we can resume an existing folder
+    bool resume = false;
+    kv_manifest m;
+    if (read_manifest(m) && manifest_compatible(m, params_, n_shards_) &&
+        m.valid_bitmap.size() == bitmap_bytes) {
+        resume = true;
+        page_valid_ = m.valid_bitmap;
+    }
+
+    shards_.resize(n_shards_);
+    for (uint32_t s = 0; s < n_shards_; ++s) {
+        const std::string sp = shard_path(s);
+        // resume: open existing without truncating; fresh: truncate to empty
+        std::FILE * fp = std::fopen(sp.c_str(), resume ? "r+b" : "w+b");
+        if (!fp && resume) {
+            // a shard went missing: fall back to a fresh folder
+            resume = false;
+            std::fill(page_valid_.begin(), page_valid_.end(), 0);
+            fp = std::fopen(sp.c_str(), "w+b");
+        }
+        if (!fp) {
+            throw std::runtime_error("llama_kv_pager: failed to open shard: " + sp);
+        }
+        shards_[s].reset(fp);
+        if (kv_ftruncate(fp, shard_bytes) != 0) {
+            throw std::runtime_error("llama_kv_pager: failed to size shard: " + sp);
+        }
+    }
+
+    if (resume) {
+        // valid pages already live on disk; seed the page table accordingly
+        for (uint32_t p = 0; p < params_.n_pages; ++p) {
+            if (page_is_valid(p)) {
+                pages_[p].tier = LLAMA_KV_TIER_DISK;
+            }
+        }
+    } else {
+        write_manifest();
     }
 }
 
@@ -107,36 +302,70 @@ bool llama_kv_pager::is_fully_resident() const {
 }
 
 void llama_kv_pager::disk_read_page(uint32_t page, void * dst) {
-    if (!file_) {
-        // no disk tier: a page that is not resident has never been written, so
-        // its content is logically zero.
-        memset(dst, 0, params_.page_bytes);
-        return;
+    switch (disk_mode_) {
+        case DISK_NONE:
+            // a page that is not resident has never been written => logically zero
+            memset(dst, 0, params_.page_bytes);
+            return;
+        case DISK_FILE: {
+            if (llama_kv_pager_fseek(file_.get(), (size_t) page * params_.page_bytes, SEEK_SET) != 0) {
+                throw std::runtime_error("llama_kv_pager: disk seek failed on read");
+            }
+            if (std::fread(dst, 1, params_.page_bytes, file_.get()) != params_.page_bytes) {
+                throw std::runtime_error("llama_kv_pager: disk read failed");
+            }
+            stats_.disk_reads++;
+            return;
+        }
+        case DISK_FOLDER: {
+            if (!page_is_valid(page)) {
+                memset(dst, 0, params_.page_bytes); // never written => zero, no I/O
+                return;
+            }
+            std::FILE * fp = shards_[shard_of(page)].get();
+            if (llama_kv_pager_fseek(fp, shard_offset(page), SEEK_SET) != 0) {
+                throw std::runtime_error("llama_kv_pager: shard seek failed on read");
+            }
+            if (std::fread(dst, 1, params_.page_bytes, fp) != params_.page_bytes) {
+                throw std::runtime_error("llama_kv_pager: shard read failed");
+            }
+            stats_.disk_reads++;
+            return;
+        }
     }
-    if (llama_kv_pager_fseek(file_.get(), (size_t) page * params_.page_bytes, SEEK_SET) != 0) {
-        throw std::runtime_error("llama_kv_pager: disk seek failed on read");
-    }
-    if (std::fread(dst, 1, params_.page_bytes, file_.get()) != params_.page_bytes) {
-        throw std::runtime_error("llama_kv_pager: disk read failed");
-    }
-    stats_.disk_reads++;
 }
 
 void llama_kv_pager::disk_write_page(uint32_t page, const void * src) {
-    if (!file_) {
-        // no disk tier: dropping a clean copy is fine because the resident
-        // tiers must be large enough to keep every page (checked at init).
-        return;
+    switch (disk_mode_) {
+        case DISK_NONE:
+            // dropping a clean copy is fine: resident tiers hold every page
+            return;
+        case DISK_FILE: {
+            if (llama_kv_pager_fseek(file_.get(), (size_t) page * params_.page_bytes, SEEK_SET) != 0) {
+                throw std::runtime_error("llama_kv_pager: disk seek failed on write");
+            }
+            if (std::fwrite(src, 1, params_.page_bytes, file_.get()) != params_.page_bytes) {
+                throw std::runtime_error("llama_kv_pager: disk write failed");
+            }
+            // flush so that a subsequent fread (after an fseek) observes the new bytes
+            std::fflush(file_.get());
+            stats_.disk_writes++;
+            return;
+        }
+        case DISK_FOLDER: {
+            std::FILE * fp = shards_[shard_of(page)].get();
+            if (llama_kv_pager_fseek(fp, shard_offset(page), SEEK_SET) != 0) {
+                throw std::runtime_error("llama_kv_pager: shard seek failed on write");
+            }
+            if (std::fwrite(src, 1, params_.page_bytes, fp) != params_.page_bytes) {
+                throw std::runtime_error("llama_kv_pager: shard write failed");
+            }
+            std::fflush(fp);
+            set_page_valid(page);
+            stats_.disk_writes++;
+            return;
+        }
     }
-    if (llama_kv_pager_fseek(file_.get(), (size_t) page * params_.page_bytes, SEEK_SET) != 0) {
-        throw std::runtime_error("llama_kv_pager: disk seek failed on write");
-    }
-    if (std::fwrite(src, 1, params_.page_bytes, file_.get()) != params_.page_bytes) {
-        throw std::runtime_error("llama_kv_pager: disk write failed");
-    }
-    // flush so that a subsequent fread (after an fseek) observes the new bytes
-    std::fflush(file_.get());
-    stats_.disk_writes++;
 }
 
 int32_t llama_kv_pager::lru_page_in_tier(llama_kv_tier tier) const {
@@ -163,7 +392,7 @@ int32_t llama_kv_pager::evict_one_ram() {
     }
     const int32_t slot = m.slot;
     ram_.slot_page[slot] = -1;
-    m.tier = file_ ? LLAMA_KV_TIER_DISK : LLAMA_KV_TIER_NONE;
+    m.tier = (disk_mode_ != DISK_NONE) ? LLAMA_KV_TIER_DISK : LLAMA_KV_TIER_NONE;
     m.slot = -1;
     stats_.ram_evictions++;
     return slot;
@@ -197,7 +426,7 @@ int32_t llama_kv_pager::evict_one_gpu() {
             disk_write_page((uint32_t) victim, tmp.data());
             m.dirty = false;
         }
-        m.tier = file_ ? LLAMA_KV_TIER_DISK : LLAMA_KV_TIER_NONE;
+        m.tier = (disk_mode_ != DISK_NONE) ? LLAMA_KV_TIER_DISK : LLAMA_KV_TIER_NONE;
         m.slot = -1;
     }
 
@@ -338,5 +567,9 @@ void llama_kv_pager::flush() {
             disk_write_page(p, src);
             m.dirty = false;
         }
+    }
+
+    if (disk_mode_ == DISK_FOLDER) {
+        write_manifest(); // persist the valid bitmap so a restart can resume
     }
 }

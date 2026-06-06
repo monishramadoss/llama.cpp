@@ -68,6 +68,16 @@ struct llama_kv_pager_params {
     // the pager keeps everything in RAM (requires ram_pages >= n_pages) or GPU.
     std::string disk_path;
 
+    // number of shard files to stripe pages across. 0 => single backing file at
+    // disk_path (legacy). >=1 => disk_path is a directory and pages are striped
+    // across this many shard files inside it (clamped to n_pages).
+    uint32_t disk_shards = 0;
+
+    // identifies the model/context/kv configuration that produced this cache.
+    // Required to safely resume an existing folder: on mismatch the folder is
+    // treated as fresh. Empty => resume disabled (folder treated as scratch).
+    std::string disk_fingerprint;
+
     // emit verbose diagnostics to stderr
     bool verbose = false;
 };
@@ -172,9 +182,40 @@ private:
 
     std::vector<page_meta>      pages_;
 
-    // disk backing for the cold tier; null when no disk tier is configured.
+    // cold-tier mode
+    enum disk_mode { DISK_NONE, DISK_FILE, DISK_FOLDER };
+
+    // on-disk manifest describing a folder cold tier (used to resume a folder)
+    struct kv_manifest {
+        uint32_t             version    = 0;
+        uint64_t             page_bytes = 0;
+        uint32_t             n_pages    = 0;
+        uint32_t             n_shards   = 0;
+        std::string          fingerprint;
+        std::vector<uint8_t> valid_bitmap; // bit p set => page p holds real data
+    };
+
+    // folder-mode helpers
+    uint32_t    shard_of(uint32_t page)     const { return page % n_shards_; }
+    size_t      shard_offset(uint32_t page) const { return (size_t)(page / n_shards_) * params_.page_bytes; }
+    std::string shard_path(uint32_t shard)  const;
+    bool        page_is_valid(uint32_t page) const;
+    void        set_page_valid(uint32_t page);
+    void        open_or_create_folder();      // ctor helper for DISK_FOLDER
+    bool        read_manifest(kv_manifest & out) const;
+    void        write_manifest();
+    static bool manifest_compatible(const kv_manifest & on_disk,
+                                    const llama_kv_pager_params & want,
+                                    uint32_t want_shards);
+
+    // disk backing for the cold tier
     struct file_deleter { void operator()(std::FILE * f) const { if (f) std::fclose(f); } };
-    std::unique_ptr<std::FILE, file_deleter> file_;
+    disk_mode disk_mode_ = DISK_NONE;
+    std::unique_ptr<std::FILE, file_deleter> file_;   // DISK_FILE
+    uint32_t  n_shards_ = 0;                           // DISK_FOLDER
+    std::string folder_path_;                          // DISK_FOLDER (no trailing '/')
+    std::vector<std::unique_ptr<std::FILE, file_deleter>> shards_; // DISK_FOLDER
+    std::vector<uint8_t> page_valid_;                  // DISK_FOLDER valid bitmap
 
     uint64_t clock_ = 0; // monotonically increasing LRU clock
 };

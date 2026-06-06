@@ -13,12 +13,30 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 static std::string tmp_path(const char * name) {
     std::string dir;
     const char * env = getenv("TMPDIR");
     dir = env ? env : "/tmp";
     return dir + "/" + name + "-" + std::to_string((uintptr_t) &name) + ".bin";
+}
+
+static std::string tmp_dir(const char * name) {
+    const char * env = getenv("TMPDIR");
+    std::string dir = env ? env : "/tmp";
+    return dir + "/" + name + "-" + std::to_string((uintptr_t) &name);
+}
+
+static void remove_dir(const std::string & dir) {
+    // best-effort cleanup of the shard files + manifest a test created
+    for (uint32_t s = 0; s < 64; ++s) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "/shard-%03u.bin", s);
+        std::remove((dir + buf).c_str());
+    }
+    std::remove((dir + "/kv-cache.manifest").c_str());
+    rmdir(dir.c_str());
 }
 
 // fill a page-sized buffer with a deterministic pattern derived from page index
@@ -257,9 +275,286 @@ static int test_flush_from_ram_and_mark_dirty_errors() {
     return 0;
 }
 
+// Folder (sharded) cold tier: write a distinct pattern into every page with a
+// tiny GPU pool so pages are forced out to the shard files, then read them all
+// back. Verifies striping + eviction + write-back + disk reads across shards.
+static int test_folder_round_trip() {
+    const size_t   page_bytes = 256;
+    const uint32_t n_pages    = 20;
+
+    const std::string dir = tmp_dir("kv-pager-folder-rt");
+    remove_dir(dir); // start clean
+
+    llama_kv_pager_params p;
+    p.page_bytes  = page_bytes;
+    p.n_pages     = n_pages;
+    p.gpu_pages   = 2;
+    p.ram_pages   = 3;
+    p.disk_path   = dir;
+    p.disk_shards = 4; // -> DISK_FOLDER, 4 shard files
+
+    llama_kv_pager pager(p);
+    CHECK(!pager.is_fully_resident());
+
+    for (uint32_t pg = 0; pg < n_pages; ++pg) {
+        void * slot = pager.acquire_gpu(pg);
+        CHECK(slot != nullptr);
+        const auto data = make_page(page_bytes, pg);
+        memcpy(slot, data.data(), page_bytes);
+        pager.mark_dirty(pg);
+    }
+    pager.flush();
+
+    for (uint32_t pg = 0; pg < n_pages; ++pg) {
+        const void * slot = pager.acquire_gpu(pg);
+        CHECK(slot != nullptr);
+        const auto expected = make_page(page_bytes, pg);
+        CHECK(memcmp(slot, expected.data(), page_bytes) == 0);
+    }
+
+    CHECK(pager.stats().disk_writes  > 0);
+    CHECK(pager.stats().disk_reads   > 0);
+    CHECK(pager.stats().gpu_evictions > 0);
+
+    // the four shard files must exist
+    for (uint32_t s = 0; s < 4; ++s) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "/shard-%03u.bin", s);
+        std::FILE * f = std::fopen((dir + buf).c_str(), "rb");
+        CHECK(f != nullptr);
+        std::fclose(f);
+    }
+
+    remove_dir(dir);
+    return 0;
+}
+
+// A page that has never been written in a fresh folder must read back as zero
+// and must not trigger a shard read (the valid bitmap short-circuits the I/O).
+static int test_folder_unwritten_reads_zero() {
+    const size_t   page_bytes = 128;
+    const uint32_t n_pages    = 12;
+
+    const std::string dir = tmp_dir("kv-pager-folder-zero");
+    remove_dir(dir);
+
+    llama_kv_pager_params p;
+    p.page_bytes  = page_bytes;
+    p.n_pages     = n_pages;
+    p.gpu_pages   = 2;
+    p.ram_pages   = 2;
+    p.disk_path   = dir;
+    p.disk_shards = 3;
+
+    llama_kv_pager pager(p);
+
+    const uint64_t reads_before = pager.stats().disk_reads;
+    const void * slot = pager.acquire_gpu(7); // never written
+    CHECK(slot != nullptr);
+
+    std::vector<uint8_t> zero(page_bytes, 0);
+    CHECK(memcmp(slot, zero.data(), page_bytes) == 0);
+    CHECK(pager.stats().disk_reads == reads_before); // no shard read happened
+
+    remove_dir(dir);
+    return 0;
+}
+
+// Build a folder cache, write + flush some pages, destroy it, then rebuild on
+// the same folder with a matching fingerprint. The written pages must come back
+// as DISK-resident with their exact bytes (resume across "process restarts").
+static int test_folder_resume_round_trip() {
+    const size_t   page_bytes = 192;
+    const uint32_t n_pages    = 16;
+    const uint32_t written[]  = {0, 5, 9, 15};
+
+    const std::string dir = tmp_dir("kv-pager-folder-resume");
+    remove_dir(dir);
+
+    {
+        llama_kv_pager_params p;
+        p.page_bytes       = page_bytes;
+        p.n_pages          = n_pages;
+        p.gpu_pages        = 2;
+        p.ram_pages        = 2;
+        p.disk_path        = dir;
+        p.disk_shards      = 4;
+        p.disk_fingerprint = "model-A/ctx-16/f16";
+
+        llama_kv_pager pager(p);
+        for (uint32_t pg : written) {
+            void * slot = pager.acquire_gpu(pg);
+            const auto data = make_page(page_bytes, pg);
+            memcpy(slot, data.data(), page_bytes);
+            pager.mark_dirty(pg);
+        }
+        pager.flush(); // persists data + manifest (valid bitmap)
+    } // first pager destroyed -> shards closed
+
+    {
+        llama_kv_pager_params p;
+        p.page_bytes       = page_bytes;
+        p.n_pages          = n_pages;
+        p.gpu_pages        = 2;
+        p.ram_pages        = 2;
+        p.disk_path        = dir;
+        p.disk_shards      = 4;
+        p.disk_fingerprint = "model-A/ctx-16/f16"; // matches -> resume
+
+        llama_kv_pager pager(p);
+        for (uint32_t pg : written) {
+            CHECK(pager.tier_of(pg) == LLAMA_KV_TIER_DISK); // seeded from manifest
+        }
+        for (uint32_t pg : written) {
+            const void * slot = pager.acquire_gpu(pg);
+            const auto expected = make_page(page_bytes, pg);
+            CHECK(memcmp(slot, expected.data(), page_bytes) == 0);
+        }
+    }
+
+    remove_dir(dir);
+    return 0;
+}
+
+// Resume must be REJECTED when the fingerprint or geometry differs, and when no
+// fingerprint is supplied. In every rejected case the folder is treated as fresh
+// and previously written pages must read back as zero (no stale data surfaced).
+static int test_folder_resume_rejected_on_mismatch() {
+    const size_t   page_bytes = 128;
+    const uint32_t n_pages    = 12;
+    const uint32_t probe      = 4;
+
+    const std::string dir = tmp_dir("kv-pager-folder-reject");
+
+    auto seed_folder = [&](const std::string & fingerprint) {
+        remove_dir(dir);
+        llama_kv_pager_params p;
+        p.page_bytes       = page_bytes;
+        p.n_pages          = n_pages;
+        p.gpu_pages        = 2;
+        p.ram_pages        = 2;
+        p.disk_path        = dir;
+        p.disk_shards      = 3;
+        p.disk_fingerprint = fingerprint;
+        llama_kv_pager pager(p);
+        void * slot = pager.acquire_gpu(probe);
+        const auto data = make_page(page_bytes, probe);
+        memcpy(slot, data.data(), page_bytes);
+        pager.mark_dirty(probe);
+        pager.flush();
+    };
+
+    auto reopen_expects_fresh = [&](const std::string & fingerprint, uint32_t shards) {
+        llama_kv_pager_params p;
+        p.page_bytes       = page_bytes;
+        p.n_pages          = n_pages;
+        p.gpu_pages        = 2;
+        p.ram_pages        = 2;
+        p.disk_path        = dir;
+        p.disk_shards      = shards;
+        p.disk_fingerprint = fingerprint;
+        llama_kv_pager pager(p);
+        // rejected resume => page is NOT seeded as DISK and reads back zero
+        CHECK(pager.tier_of(probe) == LLAMA_KV_TIER_NONE);
+        const void * slot = pager.acquire_gpu(probe);
+        std::vector<uint8_t> zero(page_bytes, 0);
+        CHECK(memcmp(slot, zero.data(), page_bytes) == 0);
+        return 0;
+    };
+
+    // 1) different fingerprint -> fresh
+    seed_folder("model-A");
+    if (reopen_expects_fresh("model-B", 3)) return 1;
+
+    // 2) different shard count (geometry) -> fresh
+    seed_folder("model-A");
+    if (reopen_expects_fresh("model-A", 4)) return 1;
+
+    // 3) empty fingerprint -> resume not requested -> fresh
+    seed_folder("model-A");
+    if (reopen_expects_fresh("", 3)) return 1;
+
+    remove_dir(dir);
+    return 0;
+}
+
+// Folder-mode misconfigurations must be rejected, and n_shards > n_pages must be
+// clamped (so empty shard files are never created).
+static int test_folder_invalid_config() {
+    // disk_shards >= 1 but no path -> error
+    bool threw = false;
+    try {
+        llama_kv_pager_params p;
+        p.page_bytes  = 64;
+        p.n_pages     = 4;
+        p.gpu_pages   = 1;
+        p.ram_pages   = 1;
+        p.disk_shards = 2; // folder mode requested without a path
+        llama_kv_pager pager(p);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // disk_path points at a regular file, not a directory -> error
+    threw = false;
+    const std::string file = tmp_path("kv-pager-notadir");
+    {
+        std::FILE * f = std::fopen(file.c_str(), "wb");
+        CHECK(f != nullptr);
+        std::fclose(f);
+    }
+    try {
+        llama_kv_pager_params p;
+        p.page_bytes  = 64;
+        p.n_pages     = 4;
+        p.gpu_pages   = 1;
+        p.ram_pages   = 1;
+        p.disk_path   = file;
+        p.disk_shards = 2;
+        llama_kv_pager pager(p);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    CHECK(threw);
+    std::remove(file.c_str());
+
+    // n_shards > n_pages -> clamped to n_pages: exactly n_pages shard files exist,
+    // and shard index n_pages (the unclamped count) does not.
+    const std::string dir = tmp_dir("kv-pager-clamp");
+    remove_dir(dir);
+    {
+        llama_kv_pager_params p;
+        p.page_bytes  = 64;
+        p.n_pages     = 3;
+        p.gpu_pages   = 1;
+        p.ram_pages   = 1;
+        p.disk_path   = dir;
+        p.disk_shards = 8; // > n_pages -> clamp to 3
+        llama_kv_pager pager(p);
+
+        for (uint32_t s = 0; s < 3; ++s) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "/shard-%03u.bin", s);
+            std::FILE * f = std::fopen((dir + buf).c_str(), "rb");
+            CHECK(f != nullptr);
+            std::fclose(f);
+        }
+        std::FILE * extra = std::fopen((dir + "/shard-003.bin").c_str(), "rb");
+        CHECK(extra == nullptr); // shard 3 must not exist (clamped)
+    }
+    remove_dir(dir);
+    return 0;
+}
+
 int main() {
     int rc = 0;
     rc |= test_round_trip_with_disk();
+    rc |= test_folder_round_trip();
+    rc |= test_folder_unwritten_reads_zero();
+    rc |= test_folder_resume_round_trip();
+    rc |= test_folder_resume_rejected_on_mismatch();
+    rc |= test_folder_invalid_config();
     rc |= test_gpu_hit();
     rc |= test_warm_tier_staging();
     rc |= test_no_disk_fully_resident();
