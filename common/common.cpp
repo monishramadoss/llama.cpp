@@ -1629,8 +1629,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_disk_shards    = (uint32_t) params.kv_disk_shards;
     // a folder cold tier with an unset shard count gets a sensible default
     if (params.kv_offload_disk && cparams.kv_disk_shards == 0 && !params.kv_disk_path.empty()) {
-        struct stat st = {};
-        if (stat(params.kv_disk_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (fs_is_directory(params.kv_disk_path)) {
             cparams.kv_disk_shards = 8;
         }
     }

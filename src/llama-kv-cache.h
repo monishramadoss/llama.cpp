@@ -274,11 +274,16 @@ private:
     const std::string kv_disk_path;
     const uint32_t    kv_disk_shards = 0; // folder cold-tier shard count (config-ready; not yet live)
 
-    // an mmap'd backing file for a KV buffer; munmap'd and removed on destruction
+    // an mmap'd backing file for a KV buffer; unmapped and removed on destruction
     struct disk_region {
         void *      addr = nullptr;
         size_t      size = 0;
+#if defined(_WIN32)
+        intptr_t    hfile = -1; // HANDLE of the backing file (-1 == INVALID_HANDLE_VALUE)
+        intptr_t    hmap  = 0;  // HANDLE of the file-mapping object
+#else
         int         fd   = -1;
+#endif
         std::string path;
     };
     std::vector<disk_region> disk_regions;

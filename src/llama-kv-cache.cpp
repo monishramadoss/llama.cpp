@@ -15,10 +15,39 @@
 
 // for the experimental disk-backed (mmap) KV cache
 #include <cerrno>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
+
+// small portability helpers for the disk-backed KV cache
+#if defined(_WIN32)
+static bool llama_kv_disk_isdir(const char * p) {
+    const DWORD attr = GetFileAttributesA(p);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+static unsigned long llama_kv_disk_pid() {
+    return (unsigned long) GetCurrentProcessId();
+}
+#else
+static bool llama_kv_disk_isdir(const char * p) {
+    struct stat st = {};
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+static unsigned long llama_kv_disk_pid() {
+    return (unsigned long) getpid();
+}
+#endif
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -395,6 +424,20 @@ llama_kv_cache::~llama_kv_cache() {
     // ctxs_bufs (CPU buffers wrapping these regions via from_ptr) do not own the
     // memory, so unmapping here is safe.
     for (auto & r : disk_regions) {
+#if defined(_WIN32)
+        if (r.addr) {
+            UnmapViewOfFile(r.addr);
+        }
+        if (r.hmap) {
+            CloseHandle((HANDLE) r.hmap);
+        }
+        if (r.hfile != -1) {
+            CloseHandle((HANDLE) r.hfile);
+        }
+        if (!r.path.empty()) {
+            DeleteFileA(r.path.c_str());
+        }
+#else
         if (r.addr && r.addr != MAP_FAILED) {
             munmap(r.addr, r.size);
         }
@@ -404,6 +447,7 @@ llama_kv_cache::~llama_kv_cache() {
         if (!r.path.empty()) {
             unlink(r.path.c_str());
         }
+#endif
     }
 }
 
@@ -416,20 +460,51 @@ ggml_backend_buffer_t llama_kv_cache::alloc_disk_buffer(ggml_context * ctx, ggml
 
     // resolve the backing file path. kv_disk_path may be a directory (in which
     // case we create a uniquely named file inside it) or a file-name prefix.
+#if defined(_WIN32)
+    const char * tmp_env = std::getenv("TEMP");
+    std::string path = kv_disk_path.empty() ? std::string(tmp_env ? tmp_env : ".") : kv_disk_path;
+#else
     std::string path = kv_disk_path.empty() ? std::string("/tmp") : kv_disk_path;
+#endif
     {
-        struct stat st = {};
-        const bool is_dir = stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-        if (is_dir) {
-            if (path.back() == '/') {
+        if (llama_kv_disk_isdir(path.c_str())) {
+            if (path.back() == '/' || path.back() == '\\') {
                 path.pop_back();
             }
-            path += "/llama-kv-" + std::to_string((long) getpid()) + "-" + std::to_string(idx) + ".bin";
+            path += "/llama-kv-" + std::to_string(llama_kv_disk_pid()) + "-" + std::to_string(idx) + ".bin";
         } else {
             path += "." + std::to_string(idx) + ".bin";
         }
     }
 
+#if defined(_WIN32)
+    const HANDLE hfile = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hfile == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("kv disk offload: failed to open backing file '" + path + "': error " + std::to_string(GetLastError()));
+    }
+
+    // CreateFileMapping extends the file to the requested size; like a freshly
+    // ftruncate'd file on POSIX, the extended region reads as zeros.
+    const uint64_t size64 = size;
+    const HANDLE hmap = CreateFileMappingA(hfile, nullptr, PAGE_READWRITE,
+            (DWORD) (size64 >> 32), (DWORD) (size64 & 0xffffffffu), nullptr);
+    if (hmap == nullptr) {
+        const DWORD err = GetLastError();
+        CloseHandle(hfile);
+        throw std::runtime_error("kv disk offload: failed to size '" + path + "' to " + std::to_string(size) + " bytes: error " + std::to_string(err));
+    }
+
+    void * addr = MapViewOfFile(hmap, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T) size);
+    if (addr == nullptr) {
+        const DWORD err = GetLastError();
+        CloseHandle(hmap);
+        CloseHandle(hfile);
+        throw std::runtime_error("kv disk offload: mmap of '" + path + "' (" + std::to_string(size) + " bytes) failed: error " + std::to_string(err));
+    }
+
+    disk_regions.push_back({ addr, size, (intptr_t) hfile, (intptr_t) hmap, path });
+#else
     const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
         throw std::runtime_error("kv disk offload: failed to open backing file '" + path + "': " + std::strerror(errno));
@@ -452,6 +527,7 @@ ggml_backend_buffer_t llama_kv_cache::alloc_disk_buffer(ggml_context * ctx, ggml
     madvise(addr, size, MADV_SEQUENTIAL);
 
     disk_regions.push_back({ addr, size, fd, path });
+#endif
 
     LLAMA_LOG_INFO("%s: KV disk offload: mapped %.2f GiB -> %s\n", __func__,
             size / (1024.0 * 1024.0 * 1024.0), path.c_str());

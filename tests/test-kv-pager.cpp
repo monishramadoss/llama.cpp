@@ -13,19 +13,29 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <direct.h>
+#define rmdir _rmdir
+#else
 #include <unistd.h>
+#endif
+
+static std::string tmp_base() {
+    for (const char * var : { "TMPDIR", "TEMP", "TMP" }) {
+        const char * env = getenv(var);
+        if (env && *env) {
+            return env;
+        }
+    }
+    return "/tmp";
+}
 
 static std::string tmp_path(const char * name) {
-    std::string dir;
-    const char * env = getenv("TMPDIR");
-    dir = env ? env : "/tmp";
-    return dir + "/" + name + "-" + std::to_string((uintptr_t) &name) + ".bin";
+    return tmp_base() + "/" + name + "-" + std::to_string((uintptr_t) &name) + ".bin";
 }
 
 static std::string tmp_dir(const char * name) {
-    const char * env = getenv("TMPDIR");
-    std::string dir = env ? env : "/tmp";
-    return dir + "/" + name + "-" + std::to_string((uintptr_t) &name);
+    return tmp_base() + "/" + name + "-" + std::to_string((uintptr_t) &name);
 }
 
 static void remove_dir(const std::string & dir) {
