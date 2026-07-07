@@ -395,6 +395,18 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // [EXPERIMENTAL]
+        // disk-backed, tiered KV cache for very long contexts (RAM + disk staging).
+        // When kv_offload_disk is false (default) all of these are ignored and the
+        // KV cache behaves exactly as before. See src/llama-kv-pager.h.
+        bool         kv_offload_disk;   // enable the RAM/disk tiered KV pager
+        const char * kv_disk_path;      // path for the cold (disk) tier (NULL => default temp file)
+        uint32_t     kv_page_tokens;    // page size in tokens (0 => implementation default)
+        uint32_t     kv_vram_pages;     // GPU (hot) pool capacity in pages (0 => default)
+        uint32_t     kv_ram_pages;      // host RAM (warm) pool capacity in pages (0 => default)
+        uint32_t     kv_prefetch_depth; // pages to prefetch ahead (0 => disabled)
+        uint32_t     kv_disk_shards;    // shard files for a folder cold tier (0 => single file; folder path => default 8)
     };
 
     struct llama_model_tensor_override {

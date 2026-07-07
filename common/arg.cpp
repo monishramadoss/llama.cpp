@@ -2156,6 +2156,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--kv-offload-disk"},
+        "experimental: back the KV cache with a memory-mapped file on disk so a context larger than RAM can be served (default: disabled)",
+        [](common_params & params) {
+            params.kv_offload_disk = true;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_DISK"));
+    add_opt(common_arg(
+        {"--kv-disk-path"}, "PATH",
+        "directory (or file prefix) for the disk-backed KV cache cold tier (default: system temp dir)",
+        [](common_params & params, const std::string & value) {
+            params.kv_disk_path = value;
+            params.kv_offload_disk = true;
+        }
+    ).set_env("LLAMA_ARG_KV_DISK_PATH"));
+    add_opt(common_arg(
+        {"--kv-disk-shards"}, "N",
+        "number of shard files for a folder-based disk-backed KV cold tier; implies a directory --kv-disk-path (default: 8 when a folder is given)",
+        [](common_params & params, int value) {
+            params.kv_disk_shards = value;
+            params.kv_offload_disk = true;
+        }
+    ).set_env("LLAMA_ARG_KV_DISK_SHARDS"));
+    add_opt(common_arg(
+        {"--kv-page-tokens"}, "N",
+        "KV page / streaming-attention chunk size in tokens for disk-backed KV (0 = default)",
+        [](common_params & params, int value) {
+            params.kv_page_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGE_TOKENS"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

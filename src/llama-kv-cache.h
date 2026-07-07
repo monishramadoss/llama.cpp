@@ -112,9 +112,12 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                         bool   kv_offload_disk = false,
+              const std::string & kv_disk_path = std::string(),
+                         uint32_t kv_disk_shards = 0);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -261,6 +264,32 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // experimental: back the KV buffers with a memory-mapped file on disk so a
+    // context whose KV cache exceeds RAM can be served (the OS pages the working
+    // set in/out of physical memory). Paired with the streaming attention path,
+    // which scans the KV in chunks for good page-cache locality. See
+    // alloc_disk_buffer().
+    const bool        kv_offload_disk = false;
+    const std::string kv_disk_path;
+    const uint32_t    kv_disk_shards = 0; // folder cold-tier shard count (config-ready; not yet live)
+
+    // an mmap'd backing file for a KV buffer; unmapped and removed on destruction
+    struct disk_region {
+        void *      addr = nullptr;
+        size_t      size = 0;
+#if defined(_WIN32)
+        intptr_t    hfile = -1; // HANDLE of the backing file (-1 == INVALID_HANDLE_VALUE)
+        intptr_t    hmap  = 0;  // HANDLE of the file-mapping object
+#else
+        int         fd   = -1;
+#endif
+        std::string path;
+    };
+    std::vector<disk_region> disk_regions;
+
+    // allocate the tensors of ctx into a disk-backed (mmap) buffer on kv_disk_path
+    ggml_backend_buffer_t alloc_disk_buffer(ggml_context * ctx, ggml_backend_buffer_type_t buft, size_t idx);
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

@@ -211,6 +211,13 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // experimental streaming / chunked online-softmax attention. Enabled
+    // alongside the disk-backed tiered KV cache so the GPU attention working set
+    // stays bounded for very long contexts. The chunk size reuses kv_page_tokens
+    // (the page size in tokens) when set, falling back to a default otherwise.
+    cparams.attn_streaming    = params.kv_offload_disk;
+    cparams.attn_chunk_tokens = params.kv_page_tokens != 0 ? params.kv_page_tokens : 512;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -328,6 +335,13 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kv_offload_disk   =*/ params.kv_offload_disk,
+            /*.kv_disk_path      =*/ params.kv_disk_path,
+            /*.kv_page_tokens    =*/ params.kv_page_tokens,
+            /*.kv_vram_pages     =*/ params.kv_vram_pages,
+            /*.kv_ram_pages      =*/ params.kv_ram_pages,
+            /*.kv_prefetch_depth =*/ params.kv_prefetch_depth,
+            /*.kv_disk_shards    =*/ params.kv_disk_shards,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2332,6 +2346,35 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+
+    if (cparams.attn_streaming) {
+        const uint32_t n_layer = std::max<uint32_t>(1u, model.hparams.n_layer());
+
+        // Is the GPU paged-attention op available? If so (and we are offloading),
+        // attention is a single custom op per layer rather than the in-graph
+        // chunked path, so the node budget is tiny and independent of context.
+        static const bool have_paged = []() {
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                if (ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_cuda_paged_attn")) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+
+        if (cparams.offload_kqv && have_paged) {
+            // ggml_cont + ggml_scale + custom op + permute + cont_2d ~= a handful
+            res += 8u * n_layer;
+        } else {
+            // CPU in-graph chunked path expands each attention op into
+            // O(n_kv / chunk) chunks, ~27 nodes each; budget 48 for margin.
+            const uint32_t chunk    = cparams.attn_chunk_tokens > 0 ? cparams.attn_chunk_tokens : 512;
+            const uint32_t n_kv_max = std::max<uint32_t>(n_tokens, cparams.n_ctx_seq);
+            const uint32_t n_chunks = (n_kv_max + chunk - 1) / chunk;
+            res += 48u * n_chunks * n_layer;
+        }
+    }
+
     return res;
 }
 
@@ -3486,6 +3529,13 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_offload_disk             =*/ false,
+        /*.kv_disk_path                =*/ nullptr,
+        /*.kv_page_tokens              =*/ 0,
+        /*.kv_vram_pages               =*/ 0,
+        /*.kv_ram_pages                =*/ 0,
+        /*.kv_prefetch_depth           =*/ 0,
+        /*.kv_disk_shards              =*/ 0,
     };
 
     return result;

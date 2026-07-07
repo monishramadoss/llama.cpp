@@ -7,6 +7,7 @@
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
+#include "ggml-cuda/paged-attn.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
@@ -128,6 +129,30 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
+#if !defined(GGML_USE_HIP)
+        // Optionally keep *large* managed allocations resident in host RAM and
+        // let the GPU access them in place (over PCIe) instead of migrating whole
+        // pages into VRAM. This bounds VRAM pressure so a KV cache far larger than
+        // the GPU can be used as a RAM-resident staging tier without OOM, while
+        // smaller allocations (model weight buffers, compute scratch) stay free to
+        // live in VRAM for speed. GGML_CUDA_UM_PREFER_HOST gives the size
+        // threshold in MiB (a bare "1" means 4096 MiB); only allocations >= the
+        // threshold are advised to prefer host. Requires GGML_CUDA_ENABLE_UNIFIED_MEMORY.
+        if (err == cudaSuccess) {
+            const char * th_env = getenv("GGML_CUDA_UM_PREFER_HOST");
+            if (th_env != nullptr) {
+                size_t th_mib = (size_t) atoll(th_env);
+                if (th_mib <= 1) {
+                    th_mib = 4096; // default 4 GiB threshold
+                }
+                if (size >= th_mib * 1024 * 1024) {
+                    (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+                    (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, device);
+                    (void) cudaGetLastError(); // clear any non-fatal advise error
+                }
+            }
+        }
+#endif
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
@@ -2146,6 +2171,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LOG:
             ggml_cuda_op_log(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (ggml_cuda_is_paged_attn(dst)) {
+                ggml_cuda_paged_attn_forward(ctx, dst);
+                break;
+            }
+            return false;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -4848,6 +4879,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_is_paged_attn(op);
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -5138,6 +5171,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_cuda_paged_attn") == 0) {
+        return (void *)ggml_cuda_paged_attn;
     }
     return nullptr;
 }

@@ -212,6 +212,25 @@ llama_build_and_test(
     peg-parser/tests.h
 )
 
+# the kv-pager and attn-stream helpers are self-contained, so compile them into
+# the tests directly instead of relying on symbols the shared llama library does
+# not export (needed for Windows, where the DLL only exports LLAMA_API symbols)
+llama_build_and_test(test-kv-pager.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-pager.cpp)
+target_include_directories(test-kv-pager PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-attn-stream.cpp ${PROJECT_SOURCE_DIR}/src/llama-attn-stream.cpp)
+target_include_directories(test-attn-stream PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-attn-stream-graph.cpp ${PROJECT_SOURCE_DIR}/src/llama-attn-stream-graph.cpp)
+target_include_directories(test-attn-stream-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # uses llama internals (llama_model_saver) not exported with LLAMA_API
+    llama_build_and_test(test-attn-stream-e2e.cpp)
+    target_include_directories(test-attn-stream-e2e PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+
+
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
