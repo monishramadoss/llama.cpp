@@ -24,6 +24,8 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-cache-dsa.cpp
+            llama-kv-cache-dsv4.cpp
             llama-kv-pager.cpp
             llama-attn-stream.cpp
             llama-attn-stream-graph.cpp

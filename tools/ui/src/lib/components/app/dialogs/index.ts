@@ -19,6 +19,15 @@
 export { default as DialogMcpServerAddNew } from './DialogMcpServerAddNew.svelte';
 
 /**
+ * **DialogMcpServerRecommendations** - Suggested MCP servers opt-in dialog
+ *
+ * Prompts the user to enable pre-defined recommended MCP servers on first launch.
+ * Shows one switch per suggested server and persists the choice as a per-chat
+ * override so the selected servers become available in conversations.
+ */
+export { default as DialogMcpServerRecommendations } from './DialogMcpServerRecommendations.svelte';
+
+/**
  * **DialogExportSettings** - Settings export dialog with sensitive data warning
  *
  * Dialog for exporting settings with an option to include or exclude
@@ -474,3 +483,35 @@ export { default as DialogMcpResourcesBrowser } from './DialogMcpResourcesBrowse
  * ```
  */
 export { default as DialogMcpResourcePreview } from './DialogMcpResourcePreview.svelte';
+
+/**
+ * **DialogMermaidPreview** - Full-screen Mermaid diagram preview with zoom and pan
+ *
+ * Full-screen dialog for previewing Mermaid diagrams with interactive controls.
+ * Supports mouse wheel zoom, drag-to-pan, and toolbar buttons for zoom in/out,
+ * fit to view, and reset.
+ *
+ * **Architecture:**
+ * - Uses UI dialog components (`Dialog.Root`, `Dialog.Overlay`, `Dialog.Content`)
+ *   for consistent styling, animations, and accessibility
+ * - CSS transform-based zoom and pan (no external dependencies)
+ * - Pointer events for cross-device drag support (mouse + touch)
+ * - Wheel events for zoom-to-cursor functionality
+ *
+ * **Features:**
+ * - Scroll wheel zoom centered on cursor position
+ * - Click and drag to pan the diagram
+ * - Toolbar with zoom in, zoom out, fit to view, reset controls
+ * - Zoom percentage indicator
+ * - Keyboard accessible close button
+ * - Dark/light theme support
+ *
+ * @example
+ * ```svelte
+ * <DialogMermaidPreview
+ *   bind:open={showMermaidPreview}
+ *   svgHtml={mermaidSvgContent}
+ * />
+ * ```
+ */
+export { default as DialogMermaidPreview } from './DialogMermaidPreview.svelte';
