@@ -38,30 +38,65 @@ static __global__ void pa_scores(const T* Kc, const float* q, const float* maskc
     scores[ik + (size_t)iq*ldn + (size_t)h*ldn*n_q] = s;
 }
 
-template<typename T>
-static __global__ void pa_merge(const float* scores, const T* Vc, float* m, float* l, float* acc,
-                                int n, int ldn, int d_v, int n_q, int g) {
-    int iq = blockIdx.x*blockDim.x + threadIdx.x, h = blockIdx.y;
-    if (iq >= n_q) return;
-    int hk = h / g;
-    const float* sp = scores + (size_t)iq*ldn + (size_t)h*ldn*n_q;
-    float* accp = acc + (size_t)iq*d_v + (size_t)h*d_v*n_q;
-    int mi = iq + h*n_q;
-    float cmax = -INFINITY;
-    for (int ik=0; ik<n; ++ik) cmax = fmaxf(cmax, sp[ik]);
-    if (cmax == -INFINITY) return;
-    float m_old = m[mi], m_new = fmaxf(m_old, cmax);
-    float corr  = (m_old == -INFINITY) ? 0.f : expf(m_old - m_new);
-    float l_new = l[mi]*corr;
-    for (int d=0; d<d_v; ++d) accp[d] *= corr;
-    for (int ik=0; ik<n; ++ik) {
-        float s = sp[ik];
-        float p = (s == -INFINITY) ? 0.f : expf(s - m_new);
-        l_new += p;
-        const T* vp = Vc + (size_t)hk*ldn*d_v + (size_t)ik;
-        for (int d=0; d<d_v; ++d) accp[d] += p * pa_to_f(vp[(size_t)d*ldn]);
+// online-softmax merge, split into two parallel kernels (the former single
+// pa_merge kernel had one active thread per (iq, head) and was serial in the
+// chunk length, dominating decode latency at deep contexts).
+//
+// pa_softmax: one block per (iq, h); block-reduces the chunk max, converts the
+// scores to unnormalized probabilities in place, and updates (m, l), storing
+// the accumulator rescale factor exp(m_old - m_new).
+static __global__ void pa_softmax(float* scores, float* m, float* l, float* rescale,
+                                  int n, int ldn, int n_q) {
+    const int iq = blockIdx.x, h = blockIdx.y;
+    float* sc = scores + (size_t)iq*ldn + (size_t)h*ldn*n_q;
+    const int mi = iq + h*n_q;
+    __shared__ float red[256];
+
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, sc[i]);
+    red[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x+s]); __syncthreads(); }
+    const float cmax = red[0];
+    __syncthreads();
+
+    if (cmax == -INFINITY) {
+        // fully masked chunk: contribute nothing, keep (m, l, acc) untouched
+        for (int i = threadIdx.x; i < n; i += blockDim.x) sc[i] = 0.f;
+        if (threadIdx.x == 0) rescale[mi] = 1.f;
+        return;
     }
-    m[mi] = m_new; l[mi] = l_new;
+
+    const float m_old = m[mi];
+    const float m_new = fmaxf(m_old, cmax);
+    float sum = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float s = sc[i];
+        const float p = (s == -INFINITY) ? 0.f : expf(s - m_new);
+        sc[i] = p; sum += p;
+    }
+    red[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x+s]; __syncthreads(); }
+    if (threadIdx.x == 0) {
+        const float corr = (m_old == -INFINITY) ? 0.f : expf(m_old - m_new);
+        m[mi] = m_new; l[mi] = l[mi]*corr + red[0]; rescale[mi] = corr;
+    }
+}
+
+// pa_accum: one thread per (d, iq, h); rescales the accumulator and adds the
+// probability-weighted V rows (contiguous reads along the chunk dimension).
+template<typename T>
+static __global__ void pa_accum(const float* scores, const T* Vc, const float* rescale, float* acc,
+                                int n, int ldn, int d_v, int n_q, int g) {
+    const int d = blockIdx.x*blockDim.x + threadIdx.x;
+    const int iq = blockIdx.y, h = blockIdx.z;
+    if (d >= d_v) return;
+    const int hk = h / g;
+    const float* p = scores + (size_t)iq*ldn + (size_t)h*ldn*n_q;
+    const T* vp = Vc + (size_t)hk*ldn*d_v + (size_t)d*ldn;
+    float a = 0.f;
+    for (int i = 0; i < n; ++i) a += p[i] * pa_to_f(vp[i]);
+    const size_t ai = (size_t)d + (size_t)iq*d_v + (size_t)h*d_v*n_q;
+    acc[ai] = acc[ai]*rescale[iq + h*n_q] + a;
 }
 
 static __global__ void pa_finalize(const float* acc, const float* l, float* out, int d_v, int n_q) {
@@ -75,12 +110,29 @@ static __global__ void pa_finalize(const float* acc, const float* l, float* out,
 // per-device persistent scratch (paged attention runs once per attention layer
 // per token; avoid malloc/free in the hot path).
 struct pa_scratch {
-    char *Kc=nullptr,*Vc=nullptr; float *maskc=nullptr,*scores=nullptr,*m=nullptr,*l=nullptr,*acc=nullptr;
-    size_t cKc=0,cVc=0,cMsk=0,cScr=0,cM=0,cL=0,cAcc=0;
+    char *Kc=nullptr,*Vc=nullptr; float *maskc=nullptr,*scores=nullptr,*m=nullptr,*l=nullptr,*r=nullptr,*acc=nullptr;
+    size_t cKc=0,cVc=0,cMsk=0,cScr=0,cM=0,cL=0,cR=0,cAcc=0;
+    // pinned host staging, double-buffered: the CPU packs chunk i+1 into one
+    // slot while the H2D copy / kernels of chunk i consume the other. The K/V
+    // source is pageable (mmap'd, possibly disk-backed) memory, from which
+    // direct cudaMemcpy2DAsync is very slow; a CPU-side gather into pinned
+    // memory followed by one contiguous async copy is an order of magnitude
+    // faster and overlaps with GPU compute.
+    char *hK[2]={nullptr,nullptr},*hV[2]={nullptr,nullptr}; size_t cHK[2]={0,0},cHV[2]={0,0};
+    cudaEvent_t ev[2]={nullptr,nullptr};
+    // whether ev[slot] has ever been recorded; persists across pa_core calls so
+    // a later call (next layer) cannot repack a slot whose H2D is still in flight
+    bool ev_used[2]={false,false};
 };
 static pa_scratch g_scr[GGML_CUDA_MAX_DEVICES];
 
 static void pa_ensure(void** p, size_t* cap, size_t need){ if(*cap<need){ cudaFree(*p); cudaMalloc(p,need); *cap=need; } }
+
+// grow a pinned (page-locked) host buffer; on failure leave it null so the
+// caller can fall back to the direct pageable copy path.
+static void pa_ensure_host(char** p, size_t* cap, size_t need){
+    if(*cap<need){ if(*p) cudaFreeHost(*p); if(cudaMallocHost((void**)p,need)!=cudaSuccess){ *p=nullptr; cudaGetLastError(); } *cap=need; }
+}
 
 // q_dev, mask_dev (may be null), out_dev are DEVICE pointers for ONE stream;
 // k_host/v_host are HOST pointers. Enqueues all work on `stream`, no sync.
@@ -99,30 +151,58 @@ static void pa_core(int device, cudaStream_t stream,
     pa_ensure((void**)&c.Kc,&c.cKc,sz_Kc); pa_ensure((void**)&c.Vc,&c.cVc,sz_Vc);
     if(mask_dev) pa_ensure((void**)&c.maskc,&c.cMsk,sz_msk);
     pa_ensure((void**)&c.scores,&c.cScr,sz_scr); pa_ensure((void**)&c.m,&c.cM,sz_ml);
-    pa_ensure((void**)&c.l,&c.cL,sz_ml); pa_ensure((void**)&c.acc,&c.cAcc,sz_acc);
-    if(!c.Kc||!c.Vc||!c.scores||!c.m||!c.l||!c.acc) return;
+    pa_ensure((void**)&c.l,&c.cL,sz_ml); pa_ensure((void**)&c.r,&c.cR,sz_ml);
+    pa_ensure((void**)&c.acc,&c.cAcc,sz_acc);
+    if(!c.Kc||!c.Vc||!c.scores||!c.m||!c.l||!c.r||!c.acc) return;
 
     { static std::vector<float> hm; if((int)hm.size()<n_q*n_head) hm.assign((size_t)n_q*n_head,-INFINITY);
       cudaMemcpyAsync(c.m,hm.data(),sz_ml,cudaMemcpyHostToDevice,stream);
       cudaMemsetAsync(c.l,0,sz_ml,stream); cudaMemsetAsync(c.acc,0,sz_acc,stream); }
 
-    for (int off=0; off<n_kv; off+=chunk) {
+    pa_ensure_host(&c.hK[0],&c.cHK[0],sz_Kc); pa_ensure_host(&c.hK[1],&c.cHK[1],sz_Kc);
+    pa_ensure_host(&c.hV[0],&c.cHV[0],sz_Vc); pa_ensure_host(&c.hV[1],&c.cHV[1],sz_Vc);
+    const bool pinned = c.hK[0]&&c.hK[1]&&c.hV[0]&&c.hV[1];
+    if (pinned && !c.ev[0]) { cudaEventCreateWithFlags(&c.ev[0],cudaEventDisableTiming); cudaEventCreateWithFlags(&c.ev[1],cudaEventDisableTiming); }
+
+    for (int off=0,ci=0; off<n_kv; off+=chunk,++ci) {
         int n=(off+chunk<=n_kv)?chunk:(n_kv-off);
-        for(int hk=0;hk<n_head_kv;++hk)
-            cudaMemcpy2DAsync(c.Kc+(size_t)hk*d_k*ldn*es,(size_t)d_k*es,
-                              (const char*)k_host+hk*k_nb2+(size_t)off*k_nb1,k_nb1,(size_t)d_k*es,(size_t)n,cudaMemcpyHostToDevice,stream);
-        for(int hk=0;hk<n_head_kv;++hk)
-            cudaMemcpy2DAsync(c.Vc+(size_t)hk*ldn*d_v*es,(size_t)ldn*es,
-                              (const char*)v_host+hk*v_nb2+(size_t)off*es,v_nb1,(size_t)n*es,(size_t)d_v,cudaMemcpyHostToDevice,stream);
+        if (pinned) {
+            const int slot = ci & 1;
+            // don't overwrite the pinned slot until its previous H2D has drained
+            // (the pending copy may belong to this call or to the previous layer)
+            if (c.ev_used[slot]) cudaEventSynchronize(c.ev[slot]);
+            // gather the strided K/V chunk into pinned memory in device layout
+            char *dK=c.hK[slot], *dV=c.hV[slot];
+            for(int hk=0;hk<n_head_kv;++hk)
+                for(int ik=0;ik<n;++ik)
+                    memcpy(dK+(size_t)hk*d_k*ldn*es+(size_t)ik*d_k*es,
+                           (const char*)k_host+hk*k_nb2+(size_t)(off+ik)*k_nb1,(size_t)d_k*es);
+            for(int hk=0;hk<n_head_kv;++hk)
+                for(int d=0;d<d_v;++d)
+                    memcpy(dV+(size_t)hk*ldn*d_v*es+(size_t)d*ldn*es,
+                           (const char*)v_host+hk*v_nb2+(size_t)d*v_nb1+(size_t)off*es,(size_t)n*es);
+            cudaMemcpyAsync(c.Kc,dK,sz_Kc,cudaMemcpyHostToDevice,stream);
+            cudaMemcpyAsync(c.Vc,dV,sz_Vc,cudaMemcpyHostToDevice,stream);
+            cudaEventRecord(c.ev[slot],stream); c.ev_used[slot]=true;
+        } else {
+            for(int hk=0;hk<n_head_kv;++hk)
+                cudaMemcpy2DAsync(c.Kc+(size_t)hk*d_k*ldn*es,(size_t)d_k*es,
+                                  (const char*)k_host+hk*k_nb2+(size_t)off*k_nb1,k_nb1,(size_t)d_k*es,(size_t)n,cudaMemcpyHostToDevice,stream);
+            for(int hk=0;hk<n_head_kv;++hk)
+                cudaMemcpy2DAsync(c.Vc+(size_t)hk*ldn*d_v*es,(size_t)ldn*es,
+                                  (const char*)v_host+hk*v_nb2+(size_t)off*es,v_nb1,(size_t)n*es,(size_t)d_v,cudaMemcpyHostToDevice,stream);
+        }
         if(mask_dev)
             cudaMemcpy2DAsync(c.maskc,(size_t)ldn*4,(const char*)mask_dev+(size_t)off*4,mask_nb1,(size_t)n*4,(size_t)n_q,cudaMemcpyDeviceToDevice,stream);
-        dim3 gs((n+63)/64,n_q,n_head), gm((n_q+63)/64,n_head,1), b(64,1,1);
+        dim3 gs((n+63)/64,n_q,n_head), gsm(n_q,n_head,1), ga((d_v+63)/64,n_q,n_head), b(64,1,1), bsm(256,1,1);
         if (kv_f16){
             pa_scores<<<gs,b,0,stream>>>((const __half*)c.Kc,q_dev,mask_dev?c.maskc:nullptr,c.scores,d_k,n,ldn,n_q,g,scale);
-            pa_merge <<<gm,b,0,stream>>>(c.scores,(const __half*)c.Vc,c.m,c.l,c.acc,n,ldn,d_v,n_q,g);
+            pa_softmax<<<gsm,bsm,0,stream>>>(c.scores,c.m,c.l,c.r,n,ldn,n_q);
+            pa_accum <<<ga,b,0,stream>>>(c.scores,(const __half*)c.Vc,c.r,c.acc,n,ldn,d_v,n_q,g);
         } else {
             pa_scores<<<gs,b,0,stream>>>((const float*)c.Kc,q_dev,mask_dev?c.maskc:nullptr,c.scores,d_k,n,ldn,n_q,g,scale);
-            pa_merge <<<gm,b,0,stream>>>(c.scores,(const float*)c.Vc,c.m,c.l,c.acc,n,ldn,d_v,n_q,g);
+            pa_softmax<<<gsm,bsm,0,stream>>>(c.scores,c.m,c.l,c.r,n,ldn,n_q);
+            pa_accum <<<ga,b,0,stream>>>(c.scores,(const float*)c.Vc,c.r,c.acc,n,ldn,d_v,n_q,g);
         }
     }
     pa_finalize<<<dim3((d_v+63)/64,n_q,n_head),dim3(64,1,1),0,stream>>>(c.acc,c.l,out_dev,d_v,n_q);

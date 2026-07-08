@@ -2450,6 +2450,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // paged attention packs KV chunks on the CPU into pinned staging buffers
+        // and synchronizes on events; both are invisible/illegal inside CUDA
+        // graph capture, and a replayed graph would re-copy stale staging data
+        if (ggml_cuda_is_paged_attn(node)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to paged-attention node\n", __func__);
+#endif
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
