@@ -146,8 +146,19 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
                     th_mib = 4096; // default 4 GiB threshold
                 }
                 if (size >= th_mib * 1024 * 1024) {
+#if !defined(GGML_USE_MUSA) && CUDART_VERSION >= 13000
+                    // CUDA 13 replaced the int device id with cudaMemLocation
+                    cudaMemLocation loc_host = {};
+                    loc_host.type = cudaMemLocationTypeHost;
+                    (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, loc_host);
+                    cudaMemLocation loc_dev = {};
+                    loc_dev.type = cudaMemLocationTypeDevice;
+                    loc_dev.id   = device;
+                    (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, loc_dev);
+#else
                     (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
                     (void) cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, device);
+#endif // !defined(GGML_USE_MUSA) && CUDART_VERSION >= 13000
                     (void) cudaGetLastError(); // clear any non-fatal advise error
                 }
             }
