@@ -39,7 +39,11 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* disk-backed KV (attn layers only, see llama-kv-cache.h) */
+                     bool   kv_offload_disk = false,
+        const std::string & kv_disk_path = std::string(),
+                 uint32_t   kv_disk_shards = 0);
 
     ~llama_memory_hybrid() = default;
 
